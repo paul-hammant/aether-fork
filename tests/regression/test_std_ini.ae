@@ -1,0 +1,509 @@
+// Regression test for std.ini — INI file parser and formatter.
+// Portions copyright (c) 2011-2019 rickyah/ini-parser, MIT License.
+
+import std.ini
+import std.collections
+import std.string
+
+extern exit(code: int)
+
+fail(msg: string) {
+    println("FAIL: ${msg}")
+    exit(1)
+}
+
+check(cond: bool, msg: string) {
+    if cond == false {
+        fail(msg)
+    }
+}
+
+fn parse_helper(parser: *IniDataParser, ini_string: string) -> (ptr, string) {
+    data_raw, err = ini.parse(parser, ini_string)
+    return data_raw, err
+}
+
+main() {
+    println("=== Running std.ini Tests ===")
+
+    // 1. parse_ini_string_with_default_configuration
+    iniFileStr = ";comment for section1
+[section1]
+
+;comment for key1
+key1 = value1
+key2 = value5
+
+[section2]
+
+;comment for myKey1
+mykey1 = value1
+"
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, iniFileStr)
+    data = data_raw as *IniData
+    check(err == "", "default parse error: ${err}")
+    check(data != null, "default parse returned null data")
+
+    // Check section1
+    sec1 = ini.data_get_section(data, "section1")
+    check(sec1 != null, "section1 not found")
+    check(sec1.name == "section1", "wrong section1 name")
+    check(collections.string_list_size(sec1.comments) == 1, "expected 1 comment for section1")
+    check(collections.string_list_get(sec1.comments, 0) == "comment for section1", "wrong section1 comment")
+
+    // Check properties of section1
+    check(ini.section_get_value(sec1, "key1") == "value1", "wrong key1 value")
+    check(ini.section_get_value(sec1, "key2") == "value5", "wrong key2 value")
+
+    // Check comments on property key1
+    prop_key1, err2 = collections.map_get(sec1.properties, "key1")
+    check(prop_key1 != null, "key1 property struct not found")
+    prop = prop_key1 as *Property
+    check(collections.string_list_size(prop.comments) == 1, "expected 1 comment for key1")
+    check(collections.string_list_get(prop.comments, 0) == "comment for key1", "wrong key1 comment")
+
+    ini.data_free(data)
+    println("  PASS: parse_ini_string_with_default_configuration")
+
+    // 2. parse_ini_string_with_custom_configuration
+    iniFileStrCustom = "#comment for section1
+<section1>
+
+#comment for key1
+key1 = value1
+key2 = value5
+
+<section2>
+
+#comment for myKey1
+mykey1 = value1
+"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    p.scheme.comment_string = "#"
+    p.scheme.section_start_string = "<"
+    p.scheme.section_end_string = ">"
+
+    data_raw, err = parse_helper(p, iniFileStrCustom)
+    data = data_raw as *IniData
+    check(err == "", "custom parse error: ${err}")
+    check(data != null, "custom parse returned null data")
+
+    sec1 = ini.data_get_section(data, "section1")
+    check(sec1 != null, "section1 not found with custom scheme")
+    check(sec1.name == "section1", "wrong custom section1 name")
+    check(collections.string_list_size(sec1.comments) == 1, "expected 1 comment for custom section1")
+    check(collections.string_list_get(sec1.comments, 0) == "comment for section1", "wrong custom section1 comment")
+    check(ini.section_get_value(sec1, "key1") == "value1", "wrong custom key1 value")
+    check(ini.section_get_value(sec1, "key2") == "value5", "wrong custom key2 value")
+
+    ini.data_free(data)
+    println("  PASS: parse_ini_string_with_custom_configuration")
+
+    // 3. allow_keys_with_dots
+    strTest = "[section_issue.3]\nkey.with_dots = value\n"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, strTest)
+    data = data_raw as *IniData
+    check(err == "", "dot key parse error: ${err}")
+    check(ini.data_get_value(data, "section_issue.3", "key.with_dots") == "value", "wrong key.with_dots value")
+    ini.data_free(data)
+    println("  PASS: allow_keys_with_dots")
+
+    // 4. allow_duplicated_keys_in_section
+    ini_duplicated_keys = ";comentario1
+[seccion1]
+;comentario 2
+
+;valor de control
+value1 = 10.6
+value1 = 10"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    p.config.duplicate_properties_behaviour = 1 // AllowAndKeepFirstValue
+    data_raw, err = parse_helper(p, ini_duplicated_keys)
+    data = data_raw as *IniData
+    check(err == "", "duplicate key parse error: ${err}")
+    sec = ini.data_get_section(data, "seccion1")
+    check(ini.section_get_value(sec, "value1") == "10.6", string.concat("expected first value 10.6, got ", ini.section_get_value(sec, "value1")))
+    ini.data_free(data)
+    println("  PASS: allow_duplicated_keys_in_section")
+
+    // 5. check_using_another_leading_character_for_comments
+    data_str = "[test]
+# a comment
+connectionString = Server=sqlserver.domain.com;Database=main;User ID=user;Password=password"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    p.scheme.comment_string = "#"
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "leading comment parsing error: ${err}")
+    check(ini.data_get_value(data, "test", "connectionString") == "Server=sqlserver.domain.com;Database=main;User ID=user;Password=password", "wrong connection string")
+    sec = ini.data_get_section(data, "test")
+    prop_raw, err3 = collections.map_get(sec.properties, "connectionString")
+    prop = prop_raw as *Property
+    check(prop != null, "connectionString property not found")
+    check(collections.string_list_get(prop.comments, 0) == "a comment", "wrong comment for connectionString")
+    ini.data_free(data)
+    println("  PASS: check_using_another_leading_character_for_comments")
+
+    // 6. test_no_exception_is_raised_when_reading_url_like_section_names
+    data_str = "[http://example.com/page]
+key1 = value1"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "url section parse error: ${err}")
+    check(ini.data_get_value(data, "http://example.com/page", "key1") == "value1", "wrong url section value")
+    ini.data_free(data)
+    println("  PASS: test_no_exception_is_raised_when_reading_url_like_section_names")
+
+    // 7. check_can_read_keys_with_no_section
+    data_str = "key1=value1
+key2=value2
+key3=value3"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "no section parse error: ${err}")
+    check(ini.data_get_global(data, "key1") == "value1", "wrong global key1")
+    check(ini.data_get_global(data, "key2") == "value2", "wrong global key2")
+    check(ini.data_get_global(data, "key3") == "value3", "wrong global key3")
+    ini.data_free(data)
+    println("  PASS: check_can_read_keys_with_no_section")
+
+    // 8. allow_whitespace_in_section_names
+    data_str = "[Web Colaboration]
+key = value"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "whitespace section parse error: ${err}")
+    check(ini.data_has_section(data, "Web Colaboration"), "expected section 'Web Colaboration'")
+    check(ini.data_get_value(data, "Web Colaboration", "key") == "value", "wrong value in space section")
+    ini.data_free(data)
+    println("  PASS: allow_whitespace_in_section_names")
+
+    // 9. allow_skiping_unparsable_lines_disabled_by_default
+    data_str = "win]
+key1 = value1"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err != "", "expected parse error for invalid line by default")
+    check(data == null, "expected null data for invalid line parse")
+    println("  PASS: allow_skiping_unparsable_lines_disabled_by_default")
+
+    // 10. allow_skiping_unparsable_lines
+    data_str = "win]
+key1 = value1
+ = value2"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    p.config.skip_invalid_lines = true
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "expected no error with skip_invalid_lines: ${err}")
+    check(ini.data_get_global(data, "key1") == "value1", "expected global key1 to be parsed")
+    ini.data_free(data)
+    println("  PASS: allow_skiping_unparsable_lines")
+
+    // 11. allow_backslashes_in_sections
+    data_str = "[section\\subsection]
+key=value"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "backslash section error: ${err}")
+    check(ini.data_has_section(data, "section\\subsection"), "backslash section not found")
+    check(ini.data_get_value(data, "section\\subsection", "key") == "value", "wrong value in backslash section")
+    ini.data_free(data)
+    println("  PASS: allow_backslashes_in_sections")
+
+    // 12. allow_tilde_in_sections
+    data_str = "[section~subsection]
+key=value"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, data_str)
+    data = data_raw as *IniData
+    check(err == "", "tilde section error: ${err}")
+    check(ini.data_has_section(data, "section~subsection"), "tilde section not found")
+    check(ini.data_get_value(data, "section~subsection", "key") == "value", "wrong value in tilde section")
+    ini.data_free(data)
+    println("  PASS: allow_tilde_in_sections")
+
+    // 13. commentchar_property_works
+    initest = "#comment1
+[seccion1]
+#comment 2
+
+#control value
+value1 = 10.6
+value2 = 10"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    p.scheme.comment_string = "#"
+    data_raw, err = parse_helper(p, initest)
+    data = data_raw as *IniData
+    check(err == "", "commentchar property parse error: ${err}")
+    sec = ini.data_get_section(data, "seccion1")
+    check(collections.string_list_size(sec.comments) > 0, "expected comments for seccion1")
+    ini.data_free(data)
+    println("  PASS: commentchar_property_works")
+
+    // 14. allow_comments_at_end_of_sectionless_file
+    iniDataString = "
+                        ;begin
+
+                        ;value
+                        value1 = test
+
+                        ;end
+                        "
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, iniDataString)
+    data = data_raw as *IniData
+    check(err == "", "end comments parsing error: ${err}")
+    check(ini.data_has_global(data, "value1"), "expected global key value1")
+    prop_raw, err4 = collections.map_get(data.global_properties, "value1")
+    prop = prop_raw as *Property
+    check(prop != null, "property value1 not found")
+    check(collections.string_list_size(prop.comments) == 3, "expected 3 comments, got ${collections.string_list_size(prop.comments)}")
+    check(collections.string_list_get(prop.comments, 2) == "end", "expected last comment to be 'end'")
+    ini.data_free(data)
+    println("  PASS: allow_comments_at_end_of_sectionless_file")
+
+    // 15. allow_quotes_in_sections
+    iniDataString = "[W101 0.5\" wc]
+key = value
+[W103 0.5' wc]
+key2 = value2"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, iniDataString)
+    data = data_raw as *IniData
+    check(err == "", "quotes section error: ${err}")
+    check(ini.data_has_section(data, "W101 0.5\" wc"), "double quote section not found")
+    check(ini.data_has_section(data, "W103 0.5' wc"), "single quote section not found")
+    ini.data_free(data)
+    println("  PASS: allow_quotes_in_sections")
+
+    // 16. delete_all_comments
+    iniDataString = ";comment1
+key1 = 2
+;comment2
+[section1]
+
+;a value
+value1 = 10.6"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    data_raw, err = parse_helper(p, iniDataString)
+    data = data_raw as *IniData
+    check(err == "", "delete comments parse: ${err}")
+
+    g_prop_raw, err_g = collections.map_get(data.global_properties, "key1")
+    g_prop = g_prop_raw as *Property
+    check(collections.string_list_size(g_prop.comments) > 0, "expected comments for global key1")
+
+    sec = ini.data_get_section(data, "section1")
+    check(collections.string_list_size(sec.comments) > 0, "expected comments for section1")
+
+    prop_raw, err_p = collections.map_get(sec.properties, "value1")
+    prop = prop_raw as *Property
+    check(collections.string_list_size(prop.comments) > 0, "expected comments for value1")
+
+    ini.data_clear_all_comments(data)
+
+    check(collections.string_list_size(g_prop.comments) == 0, "expected 0 comments for global key1 after clear")
+    check(collections.string_list_size(sec.comments) == 0, "expected 0 comments for section1 after clear")
+    check(collections.string_list_size(prop.comments) == 0, "expected 0 comments for value1 after clear")
+
+    ini.data_free(data)
+    println("  PASS: delete_all_comments")
+
+    // 17. check_add_keydata_method_using_key_and_value_strings
+    newData = ini.data_new()
+    _ = ini.data_add_section(newData, "newSection")
+    ini.data_set_value(newData, "newSection", "newKey1", "value1")
+    check(ini.data_get_value(newData, "newSection", "newKey1") == "value1", "programmatic key addition failed")
+    ini.data_free(newData)
+    println("  PASS: check_add_keydata_method_using_key_and_value_strings")
+
+    // 18. check_deep_clone
+    input = "
+global = 1
+[section]
+key = 1
+"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    ori, err = parse_helper(p, input)
+    check(err == "", "parse for clone: ${err}")
+
+    copy = ini.data_deep_clone(ori)
+    check(copy != null, "deep clone returned null")
+
+    ini.data_set_global(copy, "global", "2")
+    ini.data_set_value(copy, "section", "key", "2")
+
+    check(ini.data_get_global(ori, "global") == "1", "original global property mutated")
+    check(ini.data_get_value(ori, "section", "key") == "1", "original section property mutated")
+    check(ini.data_get_global(copy, "global") == "2", "cloned global property not updated")
+    check(ini.data_get_value(copy, "section", "key") == "2", "cloned section property not updated")
+
+    ini.data_free(ori)
+    ini.data_free(copy)
+    println("  PASS: check_deep_clone")
+
+    // 19. check_merging_sections
+    destinySection = ini.section_new("destiny_section")
+    newSection = ini.section_new("new_section")
+
+    ini.section_set_value(destinySection, "key1", "value1")
+    ini.section_set_value(destinySection, "key2", "value2")
+
+    ini.section_set_value(newSection, "key2", "newvalue2")
+    ini.section_set_value(newSection, "key3", "value3")
+
+    ini.section_merge(destinySection, newSection)
+
+    check(ini.section_get_value(destinySection, "key1") == "value1", "merged key1 value wrong")
+    check(ini.section_get_value(destinySection, "key2") == "newvalue2", "merged key2 value wrong")
+    check(ini.section_get_value(destinySection, "key3") == "value3", "merged key3 value wrong")
+
+    ini.section_free(destinySection)
+    ini.section_free(newSection)
+    println("  PASS: check_merging_sections")
+
+    // 20. merge_parsed_ini_files
+    iniFileStrA = "
+g = 1
+[s0]
+a = 2
+[s1]
+a = 3
+b = 4
+"
+    iniFileStrB = "
+g = 11
+j = a
+[s0]
+a = 22
+b = 44
+
+[s2]
+c = 55
+"
+    ini.parser_free(p)
+    p = ini.parser_new()
+    dataA, errA = parse_helper(p, iniFileStrA)
+    dataB, errB = parse_helper(p, iniFileStrB)
+
+    ini.data_merge(dataA, dataB)
+
+    check(ini.data_get_global(dataA, "g") == "11", "merged global g wrong")
+    check(ini.data_get_global(dataA, "j") == "a", "merged global j wrong")
+    check(ini.data_get_value(dataA, "s0", "a") == "22", "merged s0 a wrong")
+    check(ini.data_get_value(dataA, "s0", "b") == "44", "merged s0 b wrong")
+    check(ini.data_get_value(dataA, "s1", "a") == "3", "merged s1 a wrong")
+    check(ini.data_get_value(dataA, "s1", "b") == "4", "merged s1 b wrong")
+    check(ini.data_get_value(dataA, "s2", "c") == "55", "merged s2 c wrong")
+
+    ini.data_free(dataA)
+    ini.data_free(dataB)
+    println("  PASS: merge_parsed_ini_files")
+
+    // 21. check_default_formatting
+    ini.parser_free(p)
+    p = ini.parser_new()
+    str = ";this is a section
+[section1]
+key = value"
+    data, err = parse_helper(p, str)
+    check(err == "", "parse for default format: ${err}")
+
+    result = ini.format(data, null)
+    check(result == str, "expected default format to equal input, got:\n${result}")
+    ini.data_free(data)
+    println("  PASS: check_default_formatting")
+
+    // 22. check_custom_formatting
+    ini.parser_free(p)
+    p = ini.parser_new()
+    str = ";this is a section
+
+[section1]
+
+
+key=value
+
+
+key2=value
+"
+    data, err = parse_helper(p, str)
+    check(err == "", "parse for custom format: ${err}")
+
+    fmt_cfg = ini.format_config_new()
+    fmt_cfg.num_spaces_between_key_and_assignment = 0
+    fmt_cfg.num_spaces_between_assignment_and_value = 0
+    fmt_cfg.new_line_before_section = true
+    fmt_cfg.new_line_after_section = true
+    fmt_cfg.new_line_before_property = true
+    fmt_cfg.new_line_after_property = true
+
+    str_alt = ";this is a section
+
+[section1]
+
+
+key2=value
+
+
+key=value
+"
+    result = ini.format(data, fmt_cfg)
+    check(result == str || result == str_alt, "expected custom format to equal input, got:\n${result}")
+
+    heap.free(fmt_cfg)
+    ini.data_free(data)
+    println("  PASS: check_custom_formatting")
+
+    // 23. Case Insensitive parsing and querying
+    ini.parser_free(p)
+    p = ini.parser_new()
+    p.config.case_insensitive = true
+    str = "[SecTIon1]
+KeyWithCaps = ValueWithCaps"
+    data, err = parse_helper(p, str)
+    check(err == "", "case insensitive parse error: ${err}")
+
+    check(ini.data_has_section(data, "section1"), "case insensitive data_has_section failed")
+    sec = ini.data_get_section(data, "section1")
+    check(sec != null, "case insensitive data_get_section failed")
+    check(sec.name == "SecTIon1", "expected to preserve original section name casing")
+
+    check(ini.section_has_value(sec, "keywithcaps"), "case insensitive section_has_value failed")
+    check(ini.section_get_value(sec, "keywithcaps") == "ValueWithCaps", "case insensitive section_get_value failed")
+
+    prop_raw, err_p = collections.map_get(sec.properties, "keywithcaps")
+    prop = prop_raw as *Property
+    check(prop != null, "expected properties key in map to be lowercase")
+    check(prop.key == "KeyWithCaps", "expected Property.key to preserve original key casing")
+
+    ini.data_free(data)
+    ini.parser_free(p)
+    println("  PASS: Case Insensitive parsing and querying")
+
+    println("\n=== All std.ini Tests Passed ===")
+}

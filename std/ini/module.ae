@@ -1,0 +1,1116 @@
+// std.ini — INI file parser and formatter.
+// Portions copyright (c) 2011-2019 rickyah/ini-parser, MIT License.
+
+import std.string
+import std.collections
+import std.mem
+import std.bytes
+import std.heap
+
+exports (
+    IniScheme, IniConfig, Property, Section, IniData, IniDataParser, IniFormattingConfiguration, MapKeys,
+    scheme_new, config_new, property_new, section_new, data_new, parser_new, format_config_new,
+    property_free, section_free, data_free, parser_free,
+    parse, format,
+    data_get_global, data_set_global, data_has_global, data_remove_global,
+    data_get_section, data_add_section, data_has_section, data_remove_section,
+    data_get_value, data_set_value, data_has_value, data_remove_value,
+    section_get_value, section_set_value, section_has_value, section_remove_value,
+    data_clear_all_comments, data_deep_clone, section_deep_clone, property_deep_clone,
+    data_merge, section_merge
+)
+
+struct IniScheme {
+    comment_string: string
+    section_start_string: string
+    section_end_string: string
+    property_assignment_string: string
+}
+
+struct IniConfig {
+    case_insensitive: bool
+    allow_keys_without_section: bool
+    duplicate_properties_behaviour: int // 0 = DisallowAndStopWithError, 1 = AllowAndKeepFirstValue, 2 = AllowAndKeepLastValue, 3 = AllowAndConcatenateValues
+    concatenate_duplicate_properties_string: string
+    throw_exceptions_on_error: bool
+    allow_duplicate_sections: bool
+    skip_invalid_lines: bool
+    trim_properties: bool
+    trim_sections: bool
+    trim_comments: bool
+    parse_comments: bool
+}
+
+struct Property {
+    key: string
+    value: string
+    comments: ptr // std.collections.string_list
+}
+
+struct Section {
+    name: string
+    comments: ptr // std.collections.string_list
+    properties: ptr // std.collections.map (key -> Property struct ptr)
+    case_insensitive: bool
+}
+
+struct IniData {
+    global_properties: ptr // std.collections.map (key -> Property struct ptr)
+    sections: ptr          // std.collections.map (section_name -> Section struct ptr)
+    scheme: IniScheme
+    config: IniConfig
+}
+
+struct IniDataParser {
+    scheme: IniScheme
+    config: IniConfig
+    has_error: bool
+    errors: ptr // std.collections.string_list
+}
+
+struct IniFormattingConfiguration {
+    new_line_type: int // 0 = Unix, 1 = Windows
+    num_spaces_between_key_and_assignment: int
+    num_spaces_between_assignment_and_value: int
+    new_line_before_section: bool
+    new_line_after_section: bool
+    new_line_before_property: bool
+    new_line_after_property: bool
+}
+
+struct MapKeys {
+    keys: ptr
+    count: int
+}
+
+// ---- Constructors ----
+
+scheme_new() -> IniScheme {
+    return IniScheme {
+        comment_string: ";",
+        section_start_string: "[",
+        section_end_string: "]",
+        property_assignment_string: "="
+    }
+}
+
+config_new() -> IniConfig {
+    return IniConfig {
+        case_insensitive: false,
+        allow_keys_without_section: true,
+        duplicate_properties_behaviour: 0,
+        concatenate_duplicate_properties_string: ";",
+        throw_exceptions_on_error: true,
+        allow_duplicate_sections: false,
+        skip_invalid_lines: false,
+        trim_properties: true,
+        trim_sections: true,
+        trim_comments: true,
+        parse_comments: true
+    }
+}
+
+format_config_new() -> *IniFormattingConfiguration {
+    cfg = heap.new(IniFormattingConfiguration)
+    cfg.new_line_type = 0 // Unix
+    cfg.num_spaces_between_key_and_assignment = 1
+    cfg.num_spaces_between_assignment_and_value = 1
+    cfg.new_line_before_section = false
+    cfg.new_line_after_section = false
+    cfg.new_line_before_property = false
+    cfg.new_line_after_property = false
+    return cfg
+}
+
+property_new(key: string, value: string) -> *Property {
+    p = heap.new(Property)
+    p.key = key
+    p.value = value
+    p.comments = collections.string_list_new()
+    return p
+}
+
+section_new(name: string) -> *Section {
+    s = heap.new(Section)
+    s.name = name
+    s.comments = collections.string_list_new()
+    s.properties = collections.map_new()
+    s.case_insensitive = false
+    return s
+}
+
+data_new() -> *IniData {
+    d = heap.new(IniData)
+    d.global_properties = collections.map_new()
+    d.sections = collections.map_new()
+    d.scheme = scheme_new()
+    d.config = config_new()
+    return d
+}
+
+parser_new() -> *IniDataParser {
+    p = heap.new(IniDataParser)
+    p.scheme = scheme_new()
+    p.config = config_new()
+    p.has_error = false
+    p.errors = collections.string_list_new()
+    return p
+}
+
+// ---- Destructors ----
+
+property_free(p: *Property) {
+    if p == null { return }
+    if p.comments != null {
+        collections.string_list_free(p.comments)
+    }
+    heap.free(p)
+}
+
+section_free(s: *Section) {
+    if s == null { return }
+    if s.comments != null {
+        collections.string_list_free(s.comments)
+    }
+    if s.properties != null {
+        keys_list = map_keys_to_string_list(s.properties)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            prop_raw, err = collections.map_get(s.properties, key)
+            prop = prop_raw as *Property
+            if prop != null {
+                property_free(prop)
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+        collections.map_free(s.properties)
+    }
+    heap.free(s)
+}
+
+data_free(d: *IniData) {
+    if d == null { return }
+    if d.global_properties != null {
+        keys_list = map_keys_to_string_list(d.global_properties)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            prop_raw, err = collections.map_get(d.global_properties, key)
+            prop = prop_raw as *Property
+            if prop != null {
+                property_free(prop)
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+        collections.map_free(d.global_properties)
+    }
+    if d.sections != null {
+        keys_list = map_keys_to_string_list(d.sections)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            sec_raw, err = collections.map_get(d.sections, key)
+            sec = sec_raw as *Section
+            if sec != null {
+                section_free(sec)
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+        collections.map_free(d.sections)
+    }
+    heap.free(d)
+}
+
+parser_free(p: *IniDataParser) {
+    if p == null { return }
+    if p.errors != null {
+        collections.string_list_free(p.errors)
+    }
+    heap.free(p)
+}
+
+// ---- Helpers ----
+
+fn get_map_key(key: string, case_insensitive: bool) -> string {
+    if case_insensitive {
+        return string.to_lower(key)
+    }
+    return key
+}
+
+fn ptr_to_string(p: ptr) -> string {
+    return p as string
+}
+
+fn map_keys_to_string_list(m: ptr) -> ptr {
+    sl = collections.string_list_new()
+    keys_ptr = collections.map_keys_raw(m)
+    if keys_ptr == null {
+        return sl
+    }
+    mk = keys_ptr as *MapKeys
+    i = 0
+    while i < mk.count {
+        s_ptr = mem.get_ptr(mk.keys, i * 8)
+        _ = collections.string_list_add(sl, ptr_to_string(s_ptr))
+        i = i + 1
+    }
+    collections.map_keys_free(keys_ptr)
+    return sl
+}
+
+fn make_spaces(n: int) -> string {
+    if n <= 0 { return "" }
+    buf = bytes.new(n)
+    i = 0
+    while i < n {
+        _ = bytes.set(buf, i, 32)
+        i = i + 1
+    }
+    return bytes.finish(buf, n)
+}
+
+fn append_str(buf: ptr, offset: int, s: string) -> int {
+    slen = string.length(s)
+    if slen == 0 { return offset }
+    _ = bytes.copy_from_string(buf, offset, s, slen)
+    return offset + slen
+}
+
+// ---- Programmatic API ----
+
+data_get_global(data: *IniData, key: string) -> string {
+    if data == null { return "" }
+    map_key = get_map_key(key, data.config.case_insensitive)
+    prop_raw, err = collections.map_get(data.global_properties, map_key)
+    prop = prop_raw as *Property
+    if prop == null { return "" }
+    return prop.value
+}
+
+data_set_global(data: *IniData, key: string, value: string) {
+    if data == null { return }
+    map_key = get_map_key(key, data.config.case_insensitive)
+    prop_raw, err = collections.map_get(data.global_properties, map_key)
+    prop = prop_raw as *Property
+    if prop != null {
+        prop.value = value
+    } else {
+        new_prop = property_new(key, value)
+        _ = collections.map_put(data.global_properties, map_key, new_prop)
+    }
+}
+
+data_has_global(data: *IniData, key: string) -> bool {
+    if data == null { return false }
+    map_key = get_map_key(key, data.config.case_insensitive)
+    return collections.map_has(data.global_properties, map_key) == 1
+}
+
+data_remove_global(data: *IniData, key: string) {
+    if data == null { return }
+    map_key = get_map_key(key, data.config.case_insensitive)
+    prop_raw, err = collections.map_get(data.global_properties, map_key)
+    prop = prop_raw as *Property
+    if prop != null {
+        property_free(prop)
+        collections.map_remove(data.global_properties, map_key)
+    }
+}
+
+data_get_section(data: *IniData, section_name: string) -> *Section {
+    if data == null { return null }
+    map_key = get_map_key(section_name, data.config.case_insensitive)
+    sec_raw, err = collections.map_get(data.sections, map_key)
+    return sec_raw as *Section
+}
+
+data_add_section(data: *IniData, section_name: string) -> *Section {
+    if data == null { return null }
+    map_key = get_map_key(section_name, data.config.case_insensitive)
+    sec_raw, err = collections.map_get(data.sections, map_key)
+    sec = sec_raw as *Section
+    if sec != null {
+        return sec
+    }
+    new_sec = section_new(section_name)
+    new_sec.case_insensitive = data.config.case_insensitive
+    _ = collections.map_put(data.sections, map_key, new_sec)
+    return new_sec
+}
+
+data_has_section(data: *IniData, section_name: string) -> bool {
+    if data == null { return false }
+    map_key = get_map_key(section_name, data.config.case_insensitive)
+    return collections.map_has(data.sections, map_key) == 1
+}
+
+data_remove_section(data: *IniData, section_name: string) {
+    if data == null { return }
+    map_key = get_map_key(section_name, data.config.case_insensitive)
+    sec_raw, err = collections.map_get(data.sections, map_key)
+    sec = sec_raw as *Section
+    if sec != null {
+        section_free(sec)
+        collections.map_remove(data.sections, map_key)
+    }
+}
+
+data_get_value(data: *IniData, section_name: string, key: string) -> string {
+    sec = data_get_section(data, section_name)
+    if sec == null { return "" }
+    return section_get_value(sec, key)
+}
+
+data_set_value(data: *IniData, section_name: string, key: string, value: string) {
+    sec = data_add_section(data, section_name)
+    if sec != null {
+        section_set_value(sec, key, value)
+    }
+}
+
+data_has_value(data: *IniData, section_name: string, key: string) -> bool {
+    sec = data_get_section(data, section_name)
+    if sec == null { return false }
+    return section_has_value(sec, key)
+}
+
+data_remove_value(data: *IniData, section_name: string, key: string) {
+    sec = data_get_section(data, section_name)
+    if sec != null {
+        section_remove_value(sec, key)
+    }
+}
+
+section_get_value(section: *Section, key: string) -> string {
+    if section == null { return "" }
+    map_key = get_map_key(key, section.case_insensitive)
+    prop_raw, err = collections.map_get(section.properties, map_key)
+    prop = prop_raw as *Property
+    if prop == null { return "" }
+    return prop.value
+}
+
+section_set_value(section: *Section, key: string, value: string) {
+    if section == null { return }
+    map_key = get_map_key(key, section.case_insensitive)
+    prop_raw, err = collections.map_get(section.properties, map_key)
+    prop = prop_raw as *Property
+    if prop != null {
+        prop.value = value
+    } else {
+        new_prop = property_new(key, value)
+        _ = collections.map_put(section.properties, map_key, new_prop)
+    }
+}
+
+section_has_value(section: *Section, key: string) -> bool {
+    if section == null { return false }
+    map_key = get_map_key(key, section.case_insensitive)
+    return collections.map_has(section.properties, map_key) == 1
+}
+
+section_remove_value(section: *Section, key: string) {
+    if section == null { return }
+    map_key = get_map_key(key, section.case_insensitive)
+    prop_raw, err = collections.map_get(section.properties, map_key)
+    prop = prop_raw as *Property
+    if prop != null {
+        property_free(prop)
+        collections.map_remove(section.properties, map_key)
+    }
+}
+
+// ---- Operations ----
+
+data_clear_all_comments(d: *IniData) {
+    if d == null { return }
+    if d.global_properties != null {
+        keys_list = map_keys_to_string_list(d.global_properties)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            prop_raw, err = collections.map_get(d.global_properties, key)
+            prop = prop_raw as *Property
+            if prop != null {
+                collections.string_list_clear(prop.comments)
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+    if d.sections != null {
+        keys_list = map_keys_to_string_list(d.sections)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            sec_raw, err = collections.map_get(d.sections, key)
+            sec = sec_raw as *Section
+            if sec != null {
+                collections.string_list_clear(sec.comments)
+                prop_keys = map_keys_to_string_list(sec.properties)
+                psz = collections.string_list_size(prop_keys)
+                j = 0
+                while j < psz {
+                    pkey = collections.string_list_get(prop_keys, j)
+                    prop_raw2, err2 = collections.map_get(sec.properties, pkey)
+                    prop = prop_raw2 as *Property
+                    if prop != null {
+                        collections.string_list_clear(prop.comments)
+                    }
+                    j = j + 1
+                }
+                collections.string_list_free(prop_keys)
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+}
+
+property_deep_clone(prop: *Property) -> *Property {
+    if prop == null { return null }
+    p = heap.new(Property)
+    p.key = prop.key
+    p.value = prop.value
+    p.comments = collections.string_list_new()
+    if prop.comments != null {
+        sz = collections.string_list_size(prop.comments)
+        i = 0
+        while i < sz {
+            c = collections.string_list_get(prop.comments, i)
+            _ = collections.string_list_add(p.comments, c)
+            i = i + 1
+        }
+    }
+    return p
+}
+
+section_deep_clone(sec: *Section) -> *Section {
+    if sec == null { return null }
+    s = heap.new(Section)
+    s.name = sec.name
+    s.case_insensitive = sec.case_insensitive
+    s.comments = collections.string_list_new()
+    if sec.comments != null {
+        sz = collections.string_list_size(sec.comments)
+        i = 0
+        while i < sz {
+            c = collections.string_list_get(sec.comments, i)
+            _ = collections.string_list_add(s.comments, c)
+            i = i + 1
+        }
+    }
+    s.properties = collections.map_new()
+    if sec.properties != null {
+        keys_list = map_keys_to_string_list(sec.properties)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            prop_raw, err = collections.map_get(sec.properties, key)
+            prop = prop_raw as *Property
+            if prop != null {
+                _ = collections.map_put(s.properties, key, property_deep_clone(prop))
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+    return s
+}
+
+data_deep_clone(data: *IniData) -> *IniData {
+    if data == null { return null }
+    d = heap.new(IniData)
+    d.scheme = data.scheme
+    d.config = data.config
+    d.global_properties = collections.map_new()
+    if data.global_properties != null {
+        keys_list = map_keys_to_string_list(data.global_properties)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            prop_raw, err = collections.map_get(data.global_properties, key)
+            prop = prop_raw as *Property
+            if prop != null {
+                _ = collections.map_put(d.global_properties, key, property_deep_clone(prop))
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+    d.sections = collections.map_new()
+    if data.sections != null {
+        keys_list = map_keys_to_string_list(data.sections)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            sec_raw, err = collections.map_get(data.sections, key)
+            sec = sec_raw as *Section
+            if sec != null {
+                _ = collections.map_put(d.sections, key, section_deep_clone(sec))
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+    return d
+}
+
+section_merge(dest: *Section, src: *Section) {
+    if dest == null || src == null { return }
+    if src.properties == null { return }
+    keys_list = map_keys_to_string_list(src.properties)
+    sz = collections.string_list_size(keys_list)
+    i = 0
+    while i < sz {
+        key = collections.string_list_get(keys_list, i)
+        prop_raw, err = collections.map_get(src.properties, key)
+        prop = prop_raw as *Property
+        if prop != null {
+            existing_raw, err2 = collections.map_get(dest.properties, key)
+            existing = existing_raw as *Property
+            if existing != null {
+                existing.value = prop.value
+            } else {
+                _ = collections.map_put(dest.properties, key, property_deep_clone(prop))
+            }
+        }
+        i = i + 1
+    }
+    collections.string_list_free(keys_list)
+}
+
+data_merge(dest: *IniData, src: *IniData) {
+    if dest == null || src == null { return }
+    if src.global_properties != null {
+        keys_list = map_keys_to_string_list(src.global_properties)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            prop_raw, err = collections.map_get(src.global_properties, key)
+            prop = prop_raw as *Property
+            if prop != null {
+                existing_raw, err2 = collections.map_get(dest.global_properties, key)
+                existing = existing_raw as *Property
+                if existing != null {
+                    existing.value = prop.value
+                } else {
+                    _ = collections.map_put(dest.global_properties, key, property_deep_clone(prop))
+                }
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+    if src.sections != null {
+        keys_list = map_keys_to_string_list(src.sections)
+        sz = collections.string_list_size(keys_list)
+        i = 0
+        while i < sz {
+            key = collections.string_list_get(keys_list, i)
+            sec_raw, err = collections.map_get(src.sections, key)
+            sec = sec_raw as *Section
+            if sec != null {
+                existing_sec_raw, err2 = collections.map_get(dest.sections, key)
+                existing_sec = existing_sec_raw as *Section
+                if existing_sec != null {
+                    section_merge(existing_sec, sec)
+                } else {
+                    _ = collections.map_put(dest.sections, key, section_deep_clone(sec))
+                }
+            }
+            i = i + 1
+        }
+        collections.string_list_free(keys_list)
+    }
+}
+
+// ---- Core Parse/Format Functions ----
+
+parse(parser: *IniDataParser, ini_string: string) -> (ptr, string) {
+    if parser == null {
+        return null, "parser is null"
+    }
+    parser.has_error = false
+    collections.string_list_clear(parser.errors)
+
+    ini_data = data_new()
+    ini_data.scheme = parser.scheme
+    ini_data.config = parser.config
+
+    lines_seq = string.split_to_seq(ini_string, "\n")
+    defer string.seq_free(lines_seq)
+
+    curr_line_num = 0
+    current_comments = collections.string_list_new()
+    defer collections.string_list_free(current_comments)
+
+    active_section = null as *Section
+    active_section_name = ""
+
+    curr = lines_seq
+    while string.seq_is_empty(curr) == 0 {
+        curr_line_num = curr_line_num + 1
+        raw_line = string.seq_head(curr)
+        curr = string.seq_tail(curr)
+
+        line_len = string.length(raw_line)
+        line = raw_line
+        if line_len > 0 && string.char_at(raw_line, line_len - 1) == 13 {
+            line = string.substring(raw_line, 0, line_len - 1)
+        }
+
+        trimmed = string.trim(line)
+        if string.length(trimmed) == 0 {
+            continue
+        }
+
+        is_comment = false
+        comment_string = parser.scheme.comment_string
+        if string.starts_with(trimmed, comment_string) == 1 {
+            is_comment = true
+        }
+
+        if is_comment {
+            if parser.config.parse_comments {
+                comm_len = string.length(trimmed)
+                cmt_prefix_len = string.length(comment_string)
+                comment_text = string.substring(trimmed, cmt_prefix_len, comm_len)
+                if parser.config.trim_comments {
+                    comment_text = string.trim(comment_text)
+                }
+                _ = collections.string_list_add(current_comments, comment_text)
+            }
+            continue
+        }
+
+        section_start = parser.scheme.section_start_string
+        section_end = parser.scheme.section_end_string
+        if string.starts_with(trimmed, section_start) == 1 {
+            end_idx = string.index_of(trimmed, section_end)
+            if end_idx >= 0 {
+                start_len = string.length(section_start)
+                section_name = string.substring(trimmed, start_len, end_idx)
+                if parser.config.trim_sections {
+                    section_name = string.trim(section_name)
+                }
+
+                if parser.config.allow_duplicate_sections == false {
+                    if data_has_section(ini_data, section_name) {
+                        if parser.config.skip_invalid_lines {
+                            continue
+                        }
+                        err_msg = "Duplicate section with name '${section_name}'."
+                        if parser.config.throw_exceptions_on_error {
+                            data_free(ini_data)
+                            return null, err_msg
+                        }
+                        _ = collections.string_list_add(parser.errors, err_msg)
+                        parser.has_error = true
+                        data_free(ini_data)
+                        return null, ""
+                    }
+                }
+
+                active_section = data_add_section(ini_data, section_name)
+                active_section_name = section_name
+
+                if parser.config.parse_comments {
+                    sz = collections.string_list_size(current_comments)
+                    i = 0
+                    while i < sz {
+                        _ = collections.string_list_add(active_section.comments, collections.string_list_get(current_comments, i))
+                        i = i + 1
+                    }
+                    collections.string_list_clear(current_comments)
+                }
+                continue
+            } else {
+                if parser.config.skip_invalid_lines {
+                    continue
+                }
+                err_msg = "No closing section value."
+                if parser.config.throw_exceptions_on_error {
+                    data_free(ini_data)
+                    return null, err_msg
+                }
+                _ = collections.string_list_add(parser.errors, err_msg)
+                parser.has_error = true
+                data_free(ini_data)
+                return null, ""
+            }
+        }
+
+        assignment = parser.scheme.property_assignment_string
+        assign_idx = string.index_of(line, assignment)
+        if assign_idx >= 0 {
+            key = string.substring(line, 0, assign_idx)
+            val_start = assign_idx + string.length(assignment)
+            val = string.substring(line, val_start, string.length(line))
+
+            if parser.config.trim_properties {
+                key = string.trim(key)
+                val = string.trim(val)
+            }
+
+            if string.length(key) == 0 {
+                if parser.config.skip_invalid_lines {
+                    continue
+                }
+                err_msg = "Found property without key."
+                if parser.config.throw_exceptions_on_error {
+                    data_free(ini_data)
+                    return null, err_msg
+                }
+                _ = collections.string_list_add(parser.errors, err_msg)
+                parser.has_error = true
+                data_free(ini_data)
+                return null, ""
+            }
+
+            if string.length(active_section_name) == 0 {
+                if parser.config.allow_keys_without_section == false {
+                    err_msg = "Properties must be contained inside a section."
+                    if parser.config.throw_exceptions_on_error {
+                        data_free(ini_data)
+                        return null, err_msg
+                    }
+                    _ = collections.string_list_add(parser.errors, err_msg)
+                    parser.has_error = true
+                    data_free(ini_data)
+                    return null, ""
+                }
+
+                map_key = get_map_key(key, ini_data.config.case_insensitive)
+                existing_raw, err = collections.map_get(ini_data.global_properties, map_key)
+                existing = existing_raw as *Property
+                if existing != null {
+                    beh = parser.config.duplicate_properties_behaviour
+                    if beh == 0 {
+                        err_msg = "Duplicated key '${key}' found in section 'global'"
+                        if parser.config.throw_exceptions_on_error {
+                            data_free(ini_data)
+                            return null, err_msg
+                        }
+                        _ = collections.string_list_add(parser.errors, err_msg)
+                        parser.has_error = true
+                        data_free(ini_data)
+                        return null, ""
+                    } else if beh == 1 {
+                        // Keep first
+                    } else if beh == 2 {
+                        existing.value = val
+                        if parser.config.parse_comments {
+                            collections.string_list_clear(existing.comments)
+                            sz = collections.string_list_size(current_comments)
+                            i = 0
+                            while i < sz {
+                                _ = collections.string_list_add(existing.comments, collections.string_list_get(current_comments, i))
+                                i = i + 1
+                            }
+                            collections.string_list_clear(current_comments)
+                        }
+                    } else if beh == 3 {
+                        existing.value = string.concat(existing.value, string.concat(parser.config.concatenate_duplicate_properties_string, val))
+                        if parser.config.parse_comments {
+                            sz = collections.string_list_size(current_comments)
+                            i = 0
+                            while i < sz {
+                                _ = collections.string_list_add(existing.comments, collections.string_list_get(current_comments, i))
+                                i = i + 1
+                            }
+                            collections.string_list_clear(current_comments)
+                        }
+                    }
+                } else {
+                    prop = property_new(key, val)
+                    _ = collections.map_put(ini_data.global_properties, map_key, prop)
+                    if parser.config.parse_comments {
+                        sz = collections.string_list_size(current_comments)
+                        i = 0
+                        while i < sz {
+                            _ = collections.string_list_add(prop.comments, collections.string_list_get(current_comments, i))
+                            i = i + 1
+                        }
+                        collections.string_list_clear(current_comments)
+                    }
+                }
+            } else {
+                map_key = get_map_key(key, ini_data.config.case_insensitive)
+                existing_raw, err = collections.map_get(active_section.properties, map_key)
+                existing = existing_raw as *Property
+                if existing != null {
+                    beh = parser.config.duplicate_properties_behaviour
+                    if beh == 0 {
+                        err_msg = "Duplicated key '${key}' found in section '${active_section_name}'"
+                        if parser.config.throw_exceptions_on_error {
+                            data_free(ini_data)
+                            return null, err_msg
+                        }
+                        _ = collections.string_list_add(parser.errors, err_msg)
+                        parser.has_error = true
+                        data_free(ini_data)
+                        return null, ""
+                    } else if beh == 1 {
+                        // Keep first
+                    } else if beh == 2 {
+                        existing.value = val
+                        if parser.config.parse_comments {
+                            collections.string_list_clear(existing.comments)
+                            sz = collections.string_list_size(current_comments)
+                            i = 0
+                            while i < sz {
+                                _ = collections.string_list_add(existing.comments, collections.string_list_get(current_comments, i))
+                                i = i + 1
+                            }
+                            collections.string_list_clear(current_comments)
+                        }
+                    } else if beh == 3 {
+                        existing.value = string.concat(existing.value, string.concat(parser.config.concatenate_duplicate_properties_string, val))
+                        if parser.config.parse_comments {
+                            sz = collections.string_list_size(current_comments)
+                            i = 0
+                            while i < sz {
+                                _ = collections.string_list_add(existing.comments, collections.string_list_get(current_comments, i))
+                                i = i + 1
+                            }
+                            collections.string_list_clear(current_comments)
+                        }
+                    }
+                } else {
+                    prop = property_new(key, val)
+                    _ = collections.map_put(active_section.properties, map_key, prop)
+                    if parser.config.parse_comments {
+                        sz = collections.string_list_size(current_comments)
+                        i = 0
+                        while i < sz {
+                            _ = collections.string_list_add(prop.comments, collections.string_list_get(current_comments, i))
+                            i = i + 1
+                        }
+                        collections.string_list_clear(current_comments)
+                    }
+                }
+            }
+            continue
+        }
+
+        if parser.config.skip_invalid_lines {
+            continue
+        }
+        err_msg = "Couldn't parse text: '${trimmed}'."
+        if parser.config.throw_exceptions_on_error {
+            data_free(ini_data)
+            return null, err_msg
+        }
+        _ = collections.string_list_add(parser.errors, err_msg)
+        parser.has_error = true
+        data_free(ini_data)
+        return null, ""
+    }
+
+    if parser.config.parse_comments && collections.string_list_size(current_comments) > 0 {
+        if collections.map_size(ini_data.sections) > 0 {
+            if string.length(active_section_name) > 0 {
+                sz = collections.string_list_size(current_comments)
+                i = 0
+                while i < sz {
+                    _ = collections.string_list_add(active_section.comments, collections.string_list_get(current_comments, i))
+                    i = i + 1
+                }
+            }
+        } else if collections.map_size(ini_data.global_properties) > 0 {
+            keys_list = map_keys_to_string_list(ini_data.global_properties)
+            sz = collections.string_list_size(keys_list)
+            if sz > 0 {
+                last_key = collections.string_list_get(keys_list, sz - 1)
+                prop_raw, err = collections.map_get(ini_data.global_properties, last_key)
+                prop = prop_raw as *Property
+                if prop != null {
+                    csz = collections.string_list_size(current_comments)
+                    i = 0
+                    while i < csz {
+                        _ = collections.string_list_add(prop.comments, collections.string_list_get(current_comments, i))
+                        i = i + 1
+                    }
+                }
+            }
+            collections.string_list_free(keys_list)
+        }
+        collections.string_list_clear(current_comments)
+    }
+
+    if parser.has_error {
+        data_free(ini_data)
+        return null, ""
+    }
+
+    return ini_data as ptr, ""
+}
+
+format(iniData: *IniData, config: *IniFormattingConfiguration) -> string {
+    if iniData == null { return "" }
+
+    temp_cfg = null as *IniFormattingConfiguration
+    fmt_cfg = config
+    if fmt_cfg == null {
+        temp_cfg = format_config_new()
+        fmt_cfg = temp_cfg
+    }
+
+    nl_str = "\n"
+    if fmt_cfg.new_line_type == 1 {
+        nl_str = "\r\n"
+    }
+
+    spaces_before = make_spaces(fmt_cfg.num_spaces_between_key_and_assignment)
+    spaces_after = make_spaces(fmt_cfg.num_spaces_between_assignment_and_value)
+
+    buf = bytes.new(4096)
+    offset = 0
+
+    if iniData.global_properties != null {
+        g_keys = map_keys_to_string_list(iniData.global_properties)
+        defer collections.string_list_free(g_keys)
+        g_sz = collections.string_list_size(g_keys)
+        g_idx = 0
+        while g_idx < g_sz {
+            g_key = collections.string_list_get(g_keys, g_idx)
+            prop_raw, err = collections.map_get(iniData.global_properties, g_key)
+            prop = prop_raw as *Property
+            if prop != null {
+                if prop.comments != null {
+                    c_sz = collections.string_list_size(prop.comments)
+                    c_i = 0
+                    while c_i < c_sz {
+                        cmt = collections.string_list_get(prop.comments, c_i)
+                        offset = append_str(buf, offset, iniData.scheme.comment_string)
+                        offset = append_str(buf, offset, cmt)
+                        offset = append_str(buf, offset, nl_str)
+                        c_i = c_i + 1
+                    }
+                }
+
+                if fmt_cfg.new_line_before_property {
+                    offset = append_str(buf, offset, nl_str)
+                }
+
+                offset = append_str(buf, offset, prop.key)
+                offset = append_str(buf, offset, spaces_before)
+                offset = append_str(buf, offset, iniData.scheme.property_assignment_string)
+                offset = append_str(buf, offset, spaces_after)
+                offset = append_str(buf, offset, prop.value)
+                offset = append_str(buf, offset, nl_str)
+
+                if fmt_cfg.new_line_after_property {
+                    offset = append_str(buf, offset, nl_str)
+                }
+            }
+            g_idx = g_idx + 1
+        }
+    }
+
+    if iniData.sections != null {
+        s_keys = map_keys_to_string_list(iniData.sections)
+        defer collections.string_list_free(s_keys)
+        s_sz = collections.string_list_size(s_keys)
+        s_idx = 0
+        while s_idx < s_sz {
+            s_key = collections.string_list_get(s_keys, s_idx)
+            sec_raw, err = collections.map_get(iniData.sections, s_key)
+            sec = sec_raw as *Section
+            if sec != null {
+                if sec.comments != null {
+                    c_sz = collections.string_list_size(sec.comments)
+                    c_i = 0
+                    while c_i < c_sz {
+                        cmt = collections.string_list_get(sec.comments, c_i)
+                        offset = append_str(buf, offset, iniData.scheme.comment_string)
+                        offset = append_str(buf, offset, cmt)
+                        offset = append_str(buf, offset, nl_str)
+                        c_i = c_i + 1
+                    }
+                }
+
+                if fmt_cfg.new_line_before_section && offset > 0 {
+                    offset = append_str(buf, offset, nl_str)
+                }
+
+                offset = append_str(buf, offset, iniData.scheme.section_start_string)
+                offset = append_str(buf, offset, sec.name)
+                offset = append_str(buf, offset, iniData.scheme.section_end_string)
+                offset = append_str(buf, offset, nl_str)
+
+                if fmt_cfg.new_line_after_section {
+                    offset = append_str(buf, offset, nl_str)
+                }
+
+                if sec.properties != null {
+                    p_keys = map_keys_to_string_list(sec.properties)
+                    defer collections.string_list_free(p_keys)
+                    p_sz = collections.string_list_size(p_keys)
+                    p_idx = 0
+                    while p_idx < p_sz {
+                        p_key = collections.string_list_get(p_keys, p_idx)
+                        prop_raw, err = collections.map_get(sec.properties, p_key)
+                        prop = prop_raw as *Property
+                        if prop != null {
+                            if prop.comments != null {
+                                c_sz = collections.string_list_size(prop.comments)
+                                c_i = 0
+                                while c_i < c_sz {
+                                    cmt = collections.string_list_get(prop.comments, c_i)
+                                    offset = append_str(buf, offset, iniData.scheme.comment_string)
+                                    offset = append_str(buf, offset, cmt)
+                                    offset = append_str(buf, offset, nl_str)
+                                    c_i = c_i + 1
+                                }
+                            }
+
+                            if fmt_cfg.new_line_before_property {
+                                offset = append_str(buf, offset, nl_str)
+                            }
+
+                            offset = append_str(buf, offset, prop.key)
+                            offset = append_str(buf, offset, spaces_before)
+                            offset = append_str(buf, offset, iniData.scheme.property_assignment_string)
+                            offset = append_str(buf, offset, spaces_after)
+                            offset = append_str(buf, offset, prop.value)
+                            offset = append_str(buf, offset, nl_str)
+
+                            if fmt_cfg.new_line_after_property {
+                                offset = append_str(buf, offset, nl_str)
+                            }
+                        }
+                        p_idx = p_idx + 1
+                    }
+                }
+            }
+            s_idx = s_idx + 1
+        }
+    }
+
+    nl_len = string.length(nl_str)
+    if offset >= nl_len {
+        offset = offset - nl_len
+    }
+
+    res = bytes.finish(buf, offset)
+    if temp_cfg != null {
+        heap.free(temp_cfg)
+    }
+    return res
+}
