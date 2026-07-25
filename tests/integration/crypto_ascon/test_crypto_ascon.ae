@@ -1,0 +1,122 @@
+// Test std.cryptography.ascon against Bouncy Castle / LWC KAT test vectors.
+import std.cryptography.ascon
+import std.bytes
+import std.string
+import std.io
+
+extern string_char_at_n(str: string, known_length: int, index: int) -> int
+
+hex_to_bytes(hex: string) -> ptr {
+    len = string.length(hex)
+    n = len / 2
+    b = bytes.new(n)
+    i = 0
+    while i < n {
+        c_hi = string_char_at_n(hex, len, i * 2)
+        c_lo = string_char_at_n(hex, len, i * 2 + 1)
+
+        hi = 0
+        if (c_hi >= 48) && (c_hi <= 57) { hi = c_hi - 48 }
+        else if (c_hi >= 97) && (c_hi <= 102) { hi = c_hi - 97 + 10 }
+        else if (c_hi >= 65) && (c_hi <= 70) { hi = c_hi - 65 + 10 }
+
+        lo = 0
+        if (c_lo >= 48) && (c_lo <= 57) { lo = c_lo - 48 }
+        else if (c_lo >= 97) && (c_lo <= 102) { lo = c_lo - 97 + 10 }
+        else if (c_lo >= 65) && (c_lo <= 70) { lo = c_lo - 65 + 10 }
+
+        bytes.set(b, i, (hi << 4) | lo)
+        i = i + 1
+    }
+    return b
+}
+
+check(label: string, got: string, want: string) -> int {
+    // Convert want to lowercase for comparison
+    want_lower = string.to_lower(want)
+    if got == want_lower {
+        println("ok   ${label}")
+        return 0
+    }
+    println("FAIL ${label}")
+    println("  got:  ${got}")
+    println("  want: ${want_lower}")
+    return 1
+}
+
+main() {
+    fails = 0
+
+    // ---- Ascon-Hash Tests ----
+    // Vector 1 (Empty msg)
+    msg1 = hex_to_bytes("")
+    ctx1, _ = ascon.new("ascon-hash")
+    ascon.update_bytes(ctx1, msg1, 0)
+    res1 = ascon.final_hex(ctx1)
+    fails = fails + check("ascon-hash empty", res1, "7346BC14F036E87AE03D0997913088F5F68411434B3CF8B54FA796A80D251F91")
+    bytes.free(msg1)
+
+    // Vector 2 (00)
+    msg2 = hex_to_bytes("00")
+    ctx2, _ = ascon.new("ascon-hash")
+    ascon.update_bytes(ctx2, msg2, 1)
+    res2 = ascon.final_hex(ctx2)
+    fails = fails + check("ascon-hash 00", res2, "8DD446ADA58A7740ECF56EB638EF775F7D5C0FD5F0C2BBBDFDEC29609D3C43A2")
+    bytes.free(msg2)
+
+    // Vector 3 (0001)
+    msg3 = hex_to_bytes("0001")
+    ctx3, _ = ascon.new("ascon-hash")
+    ascon.update_bytes(ctx3, msg3, 2)
+    res3 = ascon.final_hex(ctx3)
+    fails = fails + check("ascon-hash 0001", res3, "F77CA13BF89146D3254F1CFB7EDDBA8FA1BF162284BB29E7F645545CF9E08424")
+    bytes.free(msg3)
+
+    // Vector 4 (0001020304050607)
+    msg4 = hex_to_bytes("0001020304050607")
+    ctx4, _ = ascon.new("ascon-hash")
+    ascon.update_bytes(ctx4, msg4, 8)
+    res4 = ascon.final_hex(ctx4)
+    fails = fails + check("ascon-hash 8 bytes", res4, "F4C6A44B29915D3D57CF928A18EC6226BB8DD6C1136ACD24965F7E7780CD69CF")
+    bytes.free(msg4)
+
+
+    // ---- Ascon-HashA Tests ----
+    // Vector 1 (Empty msg)
+    msg5 = hex_to_bytes("")
+    ctx5, _ = ascon.new("ascon-hasha")
+    ascon.update_bytes(ctx5, msg5, 0)
+    res5 = ascon.final_hex(ctx5)
+    fails = fails + check("ascon-hasha empty", res5, "AECD027026D0675F9DE7A8AD8CCF512DB64B1EDCF0B20C388A0C7CC617AAA2C4")
+    bytes.free(msg5)
+
+    // Vector 2 (00)
+    msg6 = hex_to_bytes("00")
+    ctx6, _ = ascon.new("ascon-hasha")
+    ascon.update_bytes(ctx6, msg6, 1)
+    res6 = ascon.final_hex(ctx6)
+    fails = fails + check("ascon-hasha 00", res6, "5A55F0367763D334A3174F9C17FA476EB9196A22F10DAF29505633572E7756E4")
+    bytes.free(msg6)
+
+    // Vector 3 (0001)
+    msg7 = hex_to_bytes("0001")
+    ctx7, _ = ascon.new("ascon-hasha")
+    ascon.update_bytes(ctx7, msg7, 2)
+    res7 = ascon.final_hex(ctx7)
+    fails = fails + check("ascon-hasha 0001", res7, "4243FD3B872E1ED4013711382CBA032FECB4147D840DDF8436172AC62D129BC4")
+    bytes.free(msg7)
+
+    // One-shot wrappers check
+    res_one_shot = ascon.ascon_hash_hex("", 0)
+    fails = fails + check("ascon-hash one-shot empty", res_one_shot, "7346BC14F036E87AE03D0997913088F5F68411434B3CF8B54FA796A80D251F91")
+
+    res_one_shota = ascon.ascon_hasha_hex("", 0)
+    fails = fails + check("ascon-hasha one-shot empty", res_one_shota, "AECD027026D0675F9DE7A8AD8CCF512DB64B1EDCF0B20C388A0C7CC617AAA2C4")
+
+    if fails == 0 {
+        println("ALL PASS")
+        return
+    }
+    println("FAILURES: ${fails}")
+    exit(1)
+}
