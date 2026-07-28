@@ -1,0 +1,202 @@
+// Regression test for std.clapae
+// Import with: import std.clapae
+
+import std.clapae (*)
+import std.list
+import std.string
+
+extern exit(code: int)
+
+main() {
+    println("=== Running clapae tests ===")
+
+    // Define a command tree using our custom builder DSL!
+    cmd = command("myapp") {
+        about("My awesome CLI app")
+
+        arg("config") {
+            short(99) // 'c'
+            `long`("config")
+            help("Sets a custom config file")
+            takes_value(1)
+            required(0)
+        }
+
+        arg("debug") {
+            short(100) // 'd'
+            `long`("debug")
+            help("Turn debugging on")
+            is_flag(1)
+        }
+
+        arg("verbose") {
+            short(118) // 'v'
+            `long`("verbose")
+            help("Turn verbose logging on")
+            is_flag(1)
+        }
+
+        arg("input") {
+            // Positional argument
+            help("Input positional argument")
+            required(1)
+        }
+
+        subcommand("test") {
+            about("does testing things")
+            arg("list") {
+                short(108) // 'l'
+                `long`("list")
+                help("lists test values")
+                is_flag(1)
+            }
+        }
+    }
+
+    if cmd == null {
+        println("FAIL: cmd is null")
+        exit(1)
+    }
+
+    // --- Test Case 1: Simple flags, option, positional and subcommand ---
+    argv = list_new()
+    list_add_raw(argv, "-d")
+    list_add_raw(argv, "-v")
+    list_add_raw(argv, "--config=app.json")
+    list_add_raw(argv, "my_input_file")
+    list_add_raw(argv, "test")
+    list_add_raw(argv, "-l")
+
+    matches, err = parse_list(cmd, argv)
+    list_free(argv)
+
+    if err != "" {
+        println("FAIL: parse failed: ")
+        println(err)
+        exit(1)
+    }
+
+    if matches == null {
+        println("FAIL: matches is null")
+        exit(1)
+    }
+
+    // Assert top-level values
+    if get_flag(matches, "debug") != 1 {
+        println("FAIL: expected debug flag to be 1")
+        exit(1)
+    }
+
+    if get_flag(matches, "verbose") != 1 {
+        println("FAIL: expected verbose flag to be 1")
+        exit(1)
+    }
+
+    if string_equals(get_one(matches, "config"), "app.json") != 1 {
+        println("FAIL: expected config to be 'app.json', got: ")
+        println(get_one(matches, "config"))
+        exit(1)
+    }
+
+    if string_equals(get_one(matches, "input"), "my_input_file") != 1 {
+        println("FAIL: expected input to be 'my_input_file', got: ")
+        println(get_one(matches, "input"))
+        exit(1)
+    }
+
+    // Assert subcommand
+    sub_name = subcommand_name(matches)
+    if string_equals(sub_name, "test") != 1 {
+        println("FAIL: expected subcommand to be 'test', got: ")
+        println(sub_name)
+        exit(1)
+    }
+
+    sub_matches = subcommand_matches(matches, "test")
+    if sub_matches == null {
+        println("FAIL: sub_matches is null")
+        exit(1)
+    }
+
+    if get_flag(sub_matches, "list") != 1 {
+        println("FAIL: expected subcommand list flag to be 1")
+        exit(1)
+    }
+
+    free_matches(matches)
+
+    // --- Test Case 2: Compound flags & non-inline option ---
+    argv2 = list_new()
+    list_add_raw(argv2, "-dv")
+    list_add_raw(argv2, "--config")
+    list_add_raw(argv2, "other.json")
+    list_add_raw(argv2, "input_pos")
+
+    matches2, err2 = parse_list(cmd, argv2)
+    list_free(argv2)
+
+    if err2 != "" {
+        println("FAIL: parse failed on compound flags: ")
+        println(err2)
+        exit(1)
+    }
+
+    if get_flag(matches2, "debug") != 1 || get_flag(matches2, "verbose") != 1 {
+        println("FAIL: compound flags did not parse correctly")
+        exit(1)
+    }
+
+    if string_equals(get_one(matches2, "config"), "other.json") != 1 {
+        println("FAIL: expected config 'other.json', got: ")
+        println(get_one(matches2, "config"))
+        exit(1)
+    }
+
+    if string_equals(get_one(matches2, "input"), "input_pos") != 1 {
+        println("FAIL: expected input 'input_pos', got: ")
+        println(get_one(matches2, "input"))
+        exit(1)
+    }
+
+    free_matches(matches2)
+
+    // --- Test Case 3: Required argument enforcement ---
+    argv3 = list_new()
+    list_add_raw(argv3, "-d")
+
+    matches3, err3 = parse_list(cmd, argv3)
+    list_free(argv3)
+
+    if err3 == "" {
+        println("FAIL: expected parse error for missing required positional 'input'")
+        exit(1)
+    }
+    if matches3 != null {
+        free_matches(matches3)
+    }
+
+    // --- Test Case 4: Compound short option inline value (e.g. -cFILE) ---
+    argv4 = list_new()
+    list_add_raw(argv4, "-cfile_inline.json")
+    list_add_raw(argv4, "my_input")
+
+    matches4, err4 = parse_list(cmd, argv4)
+    list_free(argv4)
+
+    if err4 != "" {
+        println("FAIL: parse failed on short option inline value: ")
+        println(err4)
+        exit(1)
+    }
+
+    if string_equals(get_one(matches4, "config"), "file_inline.json") != 1 {
+        println("FAIL: expected config 'file_inline.json', got: ")
+        println(get_one(matches4, "config"))
+        exit(1)
+    }
+
+    free_matches(matches4)
+
+    free_command(cmd)
+    println("PASS")
+}
