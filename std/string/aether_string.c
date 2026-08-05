@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>  // SIZE_MAX (not in <limits.h> on MinGW)
+#include <math.h>
 
 #ifndef _WIN32
 #include <fnmatch.h>  // POSIX glob-pattern matching (string_glob_match_raw)
@@ -813,6 +814,54 @@ AetherString* string_from_float(double value) {
     return string_new(buffer);
 }
 
+// Lossless, deterministic double-to-decimal text conversion pairing with
+// `string.to_double`. Round-trips every finite IEEE-754 binary64 value,
+// and normalizes special values.
+// This uses "%.17g" format which guarantees round-trip preservation of
+// binary64 float value.
+AetherString* string_from_double(double value) {
+    // Check for special values first (Infinity, -Infinity, NaN).
+    // We can use standard isinf/isnan/signbit macros from <math.h>.
+    // (Included indirectly or we can include math.h directly, wait,
+    // math.h is not included at the top of aether_string.c? No, let's look.
+    // Wait, isinf/isnan are in <math.h>, but we can just use standard C double
+    // bitchecks or standard <math.h> macros. Let's include <math.h>).
+    if (isnan(value)) {
+        return string_new("NaN");
+    }
+    if (isinf(value)) {
+        if (value < 0.0) {
+            return string_new("-Infinity");
+        } else {
+            return string_new("Infinity");
+        }
+    }
+    if (value == 0.0) {
+        if (signbit(value)) {
+            return string_new("-0");
+        } else {
+            return string_new("0");
+        }
+    }
+
+    char buffer[128];
+    // Format using %.17g to get 17 significant digits.
+    snprintf(buffer, sizeof(buffer), "%.17g", value);
+
+    // Normalize infinity/NaN representations that standard snprintf might emit
+    // differently on different platforms, though we already handled them.
+    // Also, handle process locale decimal separator issues. We MUST ensure
+    // that the decimal separator is always '.'. If snprintf uses ',' or other
+    // separators due to the process locale, replace it with '.'.
+    for (int i = 0; buffer[i] != '\0'; i++) {
+        if (buffer[i] == ',') {
+            buffer[i] = '.';
+        }
+    }
+
+    return string_new(buffer);
+}
+
 // Inverse of string_to_int_radix: render `value` as a base-N digit
 // string. radix in [2, 36]; out-of-range radix yields the empty
 // string (caller-detectable, matches the existing string_empty()
@@ -996,7 +1045,7 @@ int string_to_float_raw(const void* str, float* out_value) {
     errno = 0;
     float val = strtof(data, &endptr);
 
-    if (endptr == data || errno == ERANGE) {
+    if (endptr == data || (errno == ERANGE && (val == HUGE_VALF || val == -HUGE_VALF))) {
         return 0;
     }
 
@@ -1015,7 +1064,7 @@ int string_to_double_raw(const void* str, double* out_value) {
     errno = 0;
     double val = strtod(data, &endptr);
 
-    if (endptr == data || errno == ERANGE) {
+    if (endptr == data || (errno == ERANGE && (val == HUGE_VAL || val == -HUGE_VAL))) {
         return 0;
     }
 
