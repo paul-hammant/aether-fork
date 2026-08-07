@@ -1,0 +1,144 @@
+// Showcase regression test for std.http.server.router
+// Demonstrates that Aether's builder-style DSL is as capable and elegant as Elixir's Ash!
+// Uses declarative Resources, JSON:API-style attributes/validations, automatic routing,
+// and custom modify_conn (Plug/middleware equivalent) handlers.
+
+import std.http
+import std.http.client
+import std.http.server.router
+import std.json
+import std.string(string_length, string_contains)
+
+extern exit(code: int)
+
+// Mock controller handler to run on success
+handle_create_author(req: ptr, res: ptr) {
+    http_response_set_status(res, 201)
+    http_response_set_header(res, "Content-Type", "application/json")
+    http_response_set_body(res, "{\"ok\":true,\"message\":\"author created\"}")
+}
+
+// modify_conn (middleware / Plug) equivalent
+modify_conn_headers(req: ptr, res: ptr) {
+    http_response_set_header(res, "X-Ash-Compliant", "true")
+}
+
+main() {
+    println("=== test_ash_router_dsl ===")
+
+    // 1. Declare Resource with Ash-style validations
+    author_resource = router.resource("author") {
+        router.attribute("name", "string", 1) // public
+        router.attribute("age", "integer", 1) // public
+
+        // age must be greater than 18
+        router.validate("age", "numericality", "greater_than", 18)
+    }
+
+    // 2. Declare Router and mount JSON API route group
+    r = router.router_create(19283) {
+        router.json_api(author_resource) {
+            router.post_route("create") |req: ptr, res: ptr| {
+                handle_create_author(req, res)
+            }
+            router.modify_conn() |req: ptr, res: ptr| {
+                modify_conn_headers(req, res)
+            }
+        }
+    }
+
+    // 3. Start the server in a detached background thread
+    router.router_start_background(r)
+
+    // Give the server a small moment to bind and listen (built-in sleep is in milliseconds!)
+    sleep(100)
+
+    // 4. Test Case 1: Valid POST (age = 25). Should pass validation and execute the handler.
+    println("  Test 1: Valid Payload")
+    payload1 = "{\"name\":\"Alice\",\"age\":25}"
+    req1 = client.request("POST", "http://127.0.0.1:19283/authors/")
+    _ = client.set_body(req1, payload1, string_length(payload1), "application/json")
+    resp1, err1 = client.send_request(req1)
+    client.request_free(req1)
+
+    if err1 != "" {
+        println("    FAIL: send_request 1 failed: ${err1}")
+        exit(1)
+    }
+
+    status1 = client.response_status(resp1)
+    body1 = client.response_body(resp1)
+    header1 = client.response_header(resp1, "X-Ash-Compliant")
+    client.response_free(resp1)
+
+    if status1 != 201 {
+        println("    FAIL: Expected 201 Created, got ${status1}")
+        exit(1)
+    }
+    if string_contains(body1, "author created") != 1 {
+        println("    FAIL: Expected success body, got: ${body1}")
+        exit(1)
+    }
+    if header1 != "true" {
+        println("    FAIL: Expected X-Ash-Compliant: true, got: ${header1}")
+        exit(1)
+    }
+    println("    PASS: Got 201 Created with custom middleware headers")
+
+    // 5. Test Case 2: Invalid POST (age = 12). Should fail numericality validation automatically.
+    println("  Test 2: Invalid Payload (age = 12, fails validation)")
+    payload2 = "{\"name\":\"Bob\",\"age\":12}"
+    req2 = client.request("POST", "http://127.0.0.1:19283/authors/")
+    _ = client.set_body(req2, payload2, string_length(payload2), "application/json")
+    resp2, err2 = client.send_request(req2)
+    client.request_free(req2)
+
+    if err2 != "" {
+        println("    FAIL: send_request 2 failed: ${err2}")
+        exit(1)
+    }
+
+    status2 = client.response_status(resp2)
+    body2 = client.response_body(resp2)
+    client.response_free(resp2)
+
+    if status2 != 422 {
+        println("    FAIL: Expected 422 Unprocessable Entity, got ${status2}")
+        exit(1)
+    }
+    if string_contains(body2, "must be greater than 18") != 1 {
+        println("    FAIL: Expected 422 JSON:API validation error, got: ${body2}")
+        exit(1)
+    }
+    println("    PASS: Got 422 Unprocessable Entity with structured JSON:API error details")
+
+    // 6. Test Case 3: Malformed Payload. Should fail with 400 Bad Request.
+    println("  Test 3: Malformed Payload")
+    payload3 = "{\"name\":"
+    req3 = client.request("POST", "http://127.0.0.1:19283/authors/")
+    _ = client.set_body(req3, payload3, string_length(payload3), "application/json")
+    resp3, err3 = client.send_request(req3)
+    client.request_free(req3)
+
+    if err3 != "" {
+        println("    FAIL: send_request 3 failed: ${err3}")
+        exit(1)
+    }
+
+    status3 = client.response_status(resp3)
+    body3 = client.response_body(resp3)
+    client.response_free(resp3)
+
+    if status3 != 400 {
+        println("    FAIL: Expected 400 Bad Request, got ${status3}")
+        exit(1)
+    }
+    if string_contains(body3, "Invalid JSON") != 1 {
+        println("    FAIL: Expected 400 JSON:API parsing error, got: ${body3}")
+        exit(1)
+    }
+    println("    PASS: Got 400 Bad Request with structured JSON:API parsing error details")
+
+    println("=== test_ash_router_dsl passed ===")
+    exit(0)
+}

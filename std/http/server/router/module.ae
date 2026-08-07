@@ -1,0 +1,376 @@
+// std.http.server.router — Ash-inspired declarative JSON API & routing DSL
+//
+// API shape:
+//   - Exposes a beautiful trailing-block builder DSL for creating HTTP servers,
+//     mapping routes, nesting prefixes, applying middleware, defining resources,
+//     and automatically running JSON validators.
+
+exports(
+    router_create, route_group, base,
+    get, post, put, delete, patch,
+    modify_conn,
+    resource, attribute, action, argument, validate,
+    json_api, get_route, index_route, post_route,
+    router_start, router_start_background
+)
+
+import std.http(http_server_create, http_server_set_host, http_server_start_raw,
+    http_server_start_background_raw, http_server_add_route, http_response_set_status,
+    http_response_set_header, http_response_set_body, http_request_method,
+    http_request_body, http_get_header, http_request_path)
+import std.list(list_new, list_add_raw, list_get_raw, list_size)
+import std.json as json
+import std.string(string_length, string_concat)
+
+struct Router {
+    server_raw: ptr
+    port: int
+    groups: ptr      // *List of *RouteGroup
+    resources: ptr   // *List of *Resource
+}
+
+struct RouteGroup {
+    router: *Router
+    prefix: string
+    routes: ptr      // *List of *Route
+    resource: *Resource
+}
+
+struct Route {
+    group: *RouteGroup
+    method: string
+    path: string
+    handler: ptr
+    modify_conn_fn: ptr
+}
+
+struct Resource {
+    name: string
+    attributes: ptr  // *List of *Attribute
+    actions: ptr     // *List of *Action
+    validations: ptr // *List of *Validation
+}
+
+struct Attribute {
+    name: string
+    attr_type: string
+    is_public: int
+}
+
+struct Action {
+    name: string
+    arguments: ptr   // *List of *Argument
+}
+
+struct Argument {
+    name: string
+    arg_type: string
+    required: int
+}
+
+struct Validation {
+    attribute_name: string
+    rule_type: string
+    param_name: string
+    param_value: int
+}
+
+// ---- Router Builders ----
+
+// Create a new Router context.
+router_create(port: int) -> ptr {
+    r = heap.new(Router)
+    r.port = port
+    r.groups = list_new()
+    r.resources = list_new()
+    r.server_raw = http_server_create(port)
+    return r
+}
+
+// Create a RouteGroup (aliased as base)
+route_group(_ctx: ptr, prefix: string) -> ptr {
+    router = _ctx as *Router
+    g = heap.new(RouteGroup)
+    g.router = router
+    g.prefix = prefix
+    g.routes = list_new()
+    g.resource = null
+    list_add_raw(router.groups, g)
+    return g
+}
+
+base(_ctx: ptr, prefix: string) -> ptr {
+    return route_group(_ctx, prefix)
+}
+
+// Register standard HTTP methods
+get(_ctx: ptr, path: string, handler: fn) {
+    g = _ctx as *RouteGroup
+    r = heap.new(Route)
+    r.group = g
+    r.method = "GET"
+    r.path = path
+    r.handler = handler
+    r.modify_conn_fn = null
+    list_add_raw(g.routes, r)
+}
+
+post(_ctx: ptr, path: string, handler: fn) {
+    g = _ctx as *RouteGroup
+    r = heap.new(Route)
+    r.group = g
+    r.method = "POST"
+    r.path = path
+    r.handler = handler
+    r.modify_conn_fn = null
+    list_add_raw(g.routes, r)
+}
+
+put(_ctx: ptr, path: string, handler: fn) {
+    g = _ctx as *RouteGroup
+    r = heap.new(Route)
+    r.group = g
+    r.method = "PUT"
+    r.path = path
+    r.handler = handler
+    r.modify_conn_fn = null
+    list_add_raw(g.routes, r)
+}
+
+delete(_ctx: ptr, path: string, handler: fn) {
+    g = _ctx as *RouteGroup
+    r = heap.new(Route)
+    r.group = g
+    r.method = "DELETE"
+    r.path = path
+    r.handler = handler
+    r.modify_conn_fn = null
+    list_add_raw(g.routes, r)
+}
+
+patch(_ctx: ptr, path: string, handler: fn) {
+    g = _ctx as *RouteGroup
+    r = heap.new(Route)
+    r.group = g
+    r.method = "PATCH"
+    r.path = path
+    r.handler = handler
+    r.modify_conn_fn = null
+    list_add_raw(g.routes, r)
+}
+
+// Custom connection modifier attached to the most recent route in the group
+modify_conn(_ctx: ptr, modify_fn: fn) {
+    g = _ctx as *RouteGroup
+    sz = list_size(g.routes)
+    if sz > 0 {
+        rt = list_get_raw(g.routes, sz - 1) as *Route
+        rt.modify_conn_fn = modify_fn
+    }
+}
+
+// ---- Resource Declarations ----
+
+// Declare a new Resource with a declarative block
+resource(name: string) -> ptr {
+    res = heap.new(Resource)
+    res.name = name
+    res.attributes = list_new()
+    res.actions = list_new()
+    res.validations = list_new()
+    return res
+}
+
+attribute(_ctx: ptr, name: string, attr_type: string, is_public: int) {
+    res = _ctx as *Resource
+    attr = heap.new(Attribute)
+    attr.name = name
+    attr.attr_type = attr_type
+    attr.is_public = is_public
+    list_add_raw(res.attributes, attr)
+}
+
+action(_ctx: ptr, name: string) -> ptr {
+    res = _ctx as *Resource
+    act = heap.new(Action)
+    act.name = name
+    act.arguments = list_new()
+    list_add_raw(res.actions, act)
+    return act
+}
+
+argument(_ctx: ptr, name: string, arg_type: string, required: int) {
+    act = _ctx as *Action
+    arg = heap.new(Argument)
+    arg.name = name
+    arg.arg_type = arg_type
+    arg.required = required
+    list_add_raw(act.arguments, arg)
+}
+
+validate(_ctx: ptr, attribute_name: string, rule_type: string, param_name: string, param_value: int) {
+    res = _ctx as *Resource
+    val = heap.new(Validation)
+    val.attribute_name = attribute_name
+    val.rule_type = rule_type
+    val.param_name = param_name
+    val.param_value = param_value
+    list_add_raw(res.validations, val)
+}
+
+// ---- JSON API Route Generator ----
+
+json_api(_ctx: ptr, res: ptr) -> ptr {
+    router = _ctx as *Router
+    g = heap.new(RouteGroup)
+    g.router = router
+    resource_ptr = res as *Resource
+    g.prefix = string_concat("/", resource_ptr.name)
+    g.prefix = string_concat(g.prefix, "s")
+    g.routes = list_new()
+    g.resource = res as *Resource
+    list_add_raw(router.groups, g)
+    list_add_raw(router.resources, res)
+    return g
+}
+
+get_route(_ctx: ptr, action_name: string, handler: fn) {
+    get(_ctx, "/:id", handler)
+}
+
+index_route(_ctx: ptr, action_name: string, handler: fn) {
+    get(_ctx, "/", handler)
+}
+
+post_route(_ctx: ptr, action_name: string, handler: fn) {
+    post(_ctx, "/", handler)
+}
+
+// ---- Router Execution and Dispatch ----
+
+@c_callback generic_dispatch(req: ptr, res: ptr, ud: ptr) {
+    rt = ud as *Route
+    res_def = rt.group.resource
+    if res_def != null {
+        method = http_request_method(req)
+        if method == "POST" || method == "PUT" || method == "PATCH" {
+            body = http_request_body(req)
+            if string_length(body) > 0 {
+                json_root, err = json.parse(body)
+                if err != "" {
+                    http_response_set_status(res, 400)
+                    http_response_set_header(res, "Content-Type", "application/json")
+
+                    err_node = json.obj()
+                    errors_arr = json.arr()
+                    err_detail = json.obj()
+                    _ = json.set(err_detail, "status", json.str("400"))
+                    _ = json.set(err_detail, "title", json.str("Invalid JSON"))
+                    _ = json.set(err_detail, "detail", json.str("bad payload"))
+                    _ = json.push(errors_arr, err_detail)
+                    _ = json.set(err_node, "errors", errors_arr)
+                    out_str, _ = json.encode(err_node)
+                    http_response_set_body(res, out_str)
+                    json.json_free(err_node)
+                    return
+                }
+
+                v_sz = list_size(res_def.validations)
+                for (i = 0; i < v_sz; i++) {
+                    val = list_get_raw(res_def.validations, i) as *Validation
+                    jval = json.json_object_get_raw(json_root, val.attribute_name)
+                    if jval != null {
+                        if val.rule_type == "numericality" {
+                            num_val = json.json_get_int(jval)
+                            if val.param_name == "greater_than" {
+                                if num_val <= val.param_value {
+                                    http_response_set_status(res, 422)
+                                    http_response_set_header(res, "Content-Type", "application/json")
+                                    err_str = "${val.attribute_name} must be greater than ${val.param_value}"
+
+                                    err_node = json.obj()
+                                    errors_arr = json.arr()
+                                    err_detail = json.obj()
+                                    _ = json.set(err_detail, "status", json.str("422"))
+                                    _ = json.set(err_detail, "title", json.str("Validation Error"))
+                                    _ = json.set(err_detail, "detail", json.str(err_str))
+                                    _ = json.push(errors_arr, err_detail)
+                                    _ = json.set(err_node, "errors", errors_arr)
+                                    out_str, _ = json.encode(err_node)
+                                    http_response_set_body(res, out_str)
+                                    json.json_free(err_node)
+
+                                    json.json_free(json_root)
+                                    return
+                                }
+                            }
+                            if val.param_name == "less_than" {
+                                if num_val >= val.param_value {
+                                    http_response_set_status(res, 422)
+                                    http_response_set_header(res, "Content-Type", "application/json")
+                                    err_str = "${val.attribute_name} must be less than ${val.param_value}"
+
+                                    err_node = json.obj()
+                                    errors_arr = json.arr()
+                                    err_detail = json.obj()
+                                    _ = json.set(err_detail, "status", json.str("422"))
+                                    _ = json.set(err_detail, "title", json.str("Validation Error"))
+                                    _ = json.set(err_detail, "detail", json.str(err_str))
+                                    _ = json.push(errors_arr, err_detail)
+                                    _ = json.set(err_node, "errors", errors_arr)
+                                    out_str, _ = json.encode(err_node)
+                                    http_response_set_body(res, out_str)
+                                    json.json_free(err_node)
+
+                                    json.json_free(json_root)
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
+                json.json_free(json_root)
+            }
+        }
+    }
+
+    if rt.modify_conn_fn != null {
+        m_fn = unbox_closure(rt.modify_conn_fn)
+        call(m_fn, req, res)
+    }
+
+    h_fn = unbox_closure(rt.handler)
+    call(h_fn, req, res)
+}
+
+router_start(router: ptr) {
+    r = router as *Router
+    g_sz = list_size(r.groups)
+    for (i = 0; i < g_sz; i++) {
+        g = list_get_raw(r.groups, i) as *RouteGroup
+        r_sz = list_size(g.routes)
+        for (j = 0; j < r_sz; j++) {
+            rt = list_get_raw(g.routes, j) as *Route
+            full_path = string_concat(g.prefix, rt.path)
+            http_server_add_route(r.server_raw, rt.method, full_path, generic_dispatch, rt)
+        }
+    }
+    http_server_set_host(r.server_raw, "127.0.0.1")
+    _ = http_server_start_raw(r.server_raw)
+}
+
+router_start_background(router: ptr) {
+    r = router as *Router
+    g_sz = list_size(r.groups)
+    for (i = 0; i < g_sz; i++) {
+        g = list_get_raw(r.groups, i) as *RouteGroup
+        r_sz = list_size(g.routes)
+        for (j = 0; j < r_sz; j++) {
+            rt = list_get_raw(g.routes, j) as *Route
+            full_path = string_concat(g.prefix, rt.path)
+            http_server_add_route(r.server_raw, rt.method, full_path, generic_dispatch, rt)
+        }
+    }
+    http_server_set_host(r.server_raw, "127.0.0.1")
+    _ = http_server_start_background_raw(r.server_raw)
+}
