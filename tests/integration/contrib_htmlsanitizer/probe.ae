@@ -1,0 +1,209 @@
+// Integration test for contrib.htmlsanitizer
+
+import contrib.htmlsanitizer
+import contrib.htmlsanitizer (DomNode)
+import std.set
+
+fail(msg: string) {
+    println("FAIL: ${msg}")
+    exit(1)
+}
+
+main() {
+    println("=== htmlsanitizer integration test ===")
+
+    // Case 1: SanitizeRemoveScriptElemTest
+    {
+        s = htmlsanitizer.new()
+        html = "<div>Hello <script>alert(1)</script> world!</div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div>Hello  world!</div>"
+        if actual != expected { fail("Case 1 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 1: <script> removed cleanly")
+    }
+
+    // Case 2: SanitizeRemoveOnclickAttrTest
+    {
+        s = htmlsanitizer.new()
+        html = "<div onclick=\"alert(1)\">Hello</div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div>Hello</div>"
+        if actual != expected { fail("Case 2 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 2: onclick attribute removed cleanly")
+    }
+
+    // Case 3: SanitizeRemoveCommentsTest
+    {
+        s = htmlsanitizer.new()
+        html = "<div>Hello <!-- comment --> world!</div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div>Hello  world!</div>"
+        if actual != expected { fail("Case 3 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 3: comments removed by default")
+    }
+
+    // Case 4: DisallowedTagTest
+    {
+        s = htmlsanitizer.new()
+        html = "<iframe></iframe><object></object><embed></embed>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = ""
+        if actual != expected { fail("Case 4 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 4: iframe, object, embed tags removed")
+    }
+
+    // Case 5: DisallowedAttributeTest
+    {
+        s = htmlsanitizer.new()
+        html = "<div onclick=\"alert(1)\" style=\"color: red;\" class=\"foo\">"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div style=\"color: red;\" class=\"foo\"></div>"
+        if actual != expected { fail("Case 5 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 5: onclick removed but style/class allowed")
+    }
+
+    // Case 6: UrlStyleTest
+    {
+        s = htmlsanitizer.new()
+        html = "<div style=\"padding: 10px; background-image: url(mailto:test@example.com)\"></div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div style=\"padding: 10px;\"></div>"
+        if actual != expected { fail("Case 6a failed: got '${actual}', want '${expected}'") }
+
+        html2 = "<div style=\"padding: 10px; background-image: url(folder/file.jpg)\"></div>"
+        actual2 = htmlsanitizer.sanitize(s, html2, "http://www.example.com")
+        expected2 = "<div style=\"padding: 10px; background-image: url(&quot;http://www.example.com/folder/file.jpg&quot;);\"></div>"
+        if actual2 != expected2 { fail("Case 6b failed: got '${actual2}', want '${expected2}'") }
+
+        html_empty = "<div style=\"--logo: url()\">x</div>"
+        actual_empty = htmlsanitizer.sanitize(s, html_empty, "https://cdn.example.com/assets/")
+        expected_empty = "<div style=\"--logo: url();\">x</div>"
+        if actual_empty != expected_empty { fail("Case 6c failed: got '${actual_empty}', want '${expected_empty}'") }
+
+        html_empty2 = "<div style=\"--logo: url(  )\">x</div>"
+        actual_empty2 = htmlsanitizer.sanitize(s, html_empty2, "https://cdn.example.com/assets/")
+        expected_empty2 = "<div style=\"--logo: url();\">x</div>" // url(  ) becomes url()
+        if actual_empty2 != expected_empty2 { fail("Case 6d failed: got '${actual_empty2}', want '${expected_empty2}'") }
+
+        html_obfuscated = "<div style=\"background-image: \\75\\72\\6c(mailto:test@example.com)\"></div>"
+        actual_obf = htmlsanitizer.sanitize(s, html_obfuscated, "")
+        expected_obf = "<div></div>"
+        if actual_obf != expected_obf { fail("Case 6e failed: got '${actual_obf}', want '${expected_obf}'") }
+
+        htmlsanitizer.free(s)
+        println("  PASS 6: CSS url styles sanitized, resolved and normalized")
+    }
+
+    // Case 7: AllowDataAttributesTest
+    {
+        s = htmlsanitizer.new()
+        s.allow_data_attributes = true
+        html = "<div data-foo=\"bar\"></div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div data-foo=\"bar\"></div>"
+        if actual != expected { fail("Case 7a failed: got '${actual}', want '${expected}'") }
+
+        s.allow_data_attributes = false
+        actual2 = htmlsanitizer.sanitize(s, html, "")
+        expected2 = "<div></div>"
+        if actual2 != expected2 { fail("Case 7b failed: got '${actual2}', want '${expected2}'") }
+
+        htmlsanitizer.free(s)
+        println("  PASS 7: data attributes controlled via allow_data_attributes")
+    }
+
+    // Case 8: KeepChildNodesTest
+    {
+        s = htmlsanitizer.new()
+        s.keep_child_nodes = true
+        html = "<div><disallowed-tag>Hello <span>world!</span></disallowed-tag></div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div>Hello <span>world!</span></div>"
+        if actual != expected { fail("Case 8a failed: got '${actual}', want '${expected}'") }
+
+        s.keep_child_nodes = false
+        actual2 = htmlsanitizer.sanitize(s, html, "")
+        expected2 = "<div></div>"
+        if actual2 != expected2 { fail("Case 8b failed: got '${actual2}', want '${expected2}'") }
+
+        htmlsanitizer.free(s)
+        println("  PASS 8: keep_child_nodes works recursively")
+    }
+
+    // Case 9: RemovingTagEventTest
+    {
+        s = htmlsanitizer.new()
+
+        // Callback can cancel removal
+        s.on_removing_tag = |elem: ptr, reason: int| {
+            nd = elem as *DomNode
+            if nd.name == "disallowed-tag" {
+                // Keep it! Return 1 to cancel removal.
+                return 1
+            }
+            return 0
+        }
+
+        html = "<div><disallowed-tag>Hello</disallowed-tag></div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div><disallowed-tag>Hello</disallowed-tag></div>"
+        if actual != expected { fail("Case 9 failed: got '${actual}', want '${expected}'") }
+
+        htmlsanitizer.free(s)
+        println("  PASS 9: on_removing_tag event can cancel tag removal")
+    }
+
+    // Case 10: RemovingCommentEventTest
+    {
+        s = htmlsanitizer.new()
+        s.on_removing_comment = |comment: ptr| {
+            // Keep it! Return 1 to cancel removal.
+            return 1
+        }
+        html = "<div>Hello <!-- comment --></div>"
+        actual = htmlsanitizer.sanitize(s, html, "")
+        expected = "<div>Hello <!-- comment --></div>"
+        if actual != expected { fail("Case 10 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 10: on_removing_comment event can cancel comment removal")
+    }
+
+    // Case 11: FilterUrlEventTest
+    {
+        s = htmlsanitizer.new()
+        s.on_filter_url = |elem: ptr, raw_url: string, resolved_url: string| {
+            if resolved_url == "http://www.example.com/assets/logo.png" {
+                return "https://cdn.xyz.com/logo.png"
+            }
+            return resolved_url
+        }
+        html = "<img src=\"assets/logo.png\">"
+        actual = htmlsanitizer.sanitize(s, html, "http://www.example.com")
+        expected = "<img src=\"https://cdn.xyz.com/logo.png\">"
+        if actual != expected { fail("Case 11 failed: got '${actual}', want '${expected}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 11: on_filter_url filters and rewrites resolved URLs")
+    }
+
+    // Case 12: ProtocolRelativeTest with base URL
+    {
+        s = htmlsanitizer.new()
+        html = "<a href=\"//www.example.com/test\">Test</a>"
+        actual1 = htmlsanitizer.sanitize(s, html, "")
+        expected1 = "<a href=\"//www.example.com/test\">Test</a>"
+        if actual1 != expected1 { fail("Case 12a failed: got '${actual1}', want '${expected1}'") }
+
+        actual2 = htmlsanitizer.sanitize(s, html, "https://www.xyz.com/123")
+        expected2 = "<a href=\"https://www.example.com/test\">Test</a>"
+        if actual2 != expected2 { fail("Case 12b failed: got '${actual2}', want '${expected2}'") }
+        htmlsanitizer.free(s)
+        println("  PASS 12: protocol relative URLs resolved cleanly with base URLs")
+    }
+
+    println("=== All htmlsanitizer tests passed ===")
+}

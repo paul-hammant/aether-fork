@@ -1,0 +1,1533 @@
+// Portions copyright (c) 2013-2016 Michael Ganss and original C# HtmlSanitizer contributors
+// Pure Aether implementation of mganss/HtmlSanitizer.
+//
+// Import with: import contrib.htmlsanitizer
+
+import std.string
+import std.bytes
+import std.collections
+import std.map
+import std.list
+import std.set
+import std.regex
+import std.strbuilder
+import std.mem
+
+exports(
+    DomNode, DomAttr, HtmlSanitizer,
+    new, free, sanitize, sanitize_document, sanitize_dom,
+    // Node kinds
+    NODE_DOC, NODE_ELEM, NODE_TEXT, NODE_COMMENT,
+    // Remove reasons
+    REASON_NOT_ALLOWED_TAG,
+    REASON_NOT_ALLOWED_ATTRIBUTE,
+    REASON_NOT_ALLOWED_STYLE,
+    REASON_NOT_ALLOWED_URL_VALUE,
+    REASON_NOT_ALLOWED_VALUE,
+    REASON_NOT_ALLOWED_CSS_CLASS,
+    REASON_CLASS_ATTRIBUTE_EMPTY,
+    REASON_STYLE_ATTRIBUTE_EMPTY,
+
+    // Internal parser exports for testing/helpers
+    new_doc_node, new_elem_node, new_text_node, new_comment_node, new_attr,
+    free_node, parse_html, html_format, html_escape, decode_html_entities, encode_utf8,
+    // Style and URL helper exports
+    get_scheme, get_origin, resolve_url, normalize_path, normalize_css_escapes,
+    sanitize_css_url_in_value, sanitize_css_style_attribute, sanitize_attributes, sanitize_node,
+    sanitize_children
+)
+
+// ---- Constants ----
+
+const NODE_DOC     = 1
+const NODE_ELEM    = 2
+const NODE_TEXT    = 3
+const NODE_COMMENT = 4
+
+const REASON_NOT_ALLOWED_TAG       = 0
+const REASON_NOT_ALLOWED_ATTRIBUTE = 1
+const REASON_NOT_ALLOWED_STYLE     = 2
+const REASON_NOT_ALLOWED_URL_VALUE = 3
+const REASON_NOT_ALLOWED_VALUE     = 4
+const REASON_NOT_ALLOWED_CSS_CLASS = 5
+const REASON_CLASS_ATTRIBUTE_EMPTY = 6
+const REASON_STYLE_ATTRIBUTE_EMPTY = 7
+
+// ---- Struct Definitions ----
+
+struct DomAttr {
+    name: string
+    value: string
+}
+
+struct DomNode {
+    kind: int // 1=Doc, 2=Elem, 3=Text, 4=Comment
+    name: string
+    value: string
+    attrs: ptr // *List of DomAttr
+    children: ptr // *List of DomNode
+    parent: ptr // *DomNode
+}
+
+struct HtmlSanitizer {
+    keep_child_nodes: bool
+    allow_data_attributes: bool
+    allowed_tags: ptr // std.set
+    allowed_attributes: ptr // std.set
+    allowed_css_properties: ptr // std.set
+    allowed_schemes: ptr // std.set
+    allowed_classes: ptr // std.set
+    uri_attributes: ptr // std.set
+    disallow_css_property_value_regex: ptr // std.regex (optional)
+
+    // Callbacks
+    on_removing_tag: ptr
+    on_removing_attribute: ptr
+    on_removing_style: ptr
+    on_removing_comment: ptr
+    on_removing_css_class: ptr
+    on_post_process_node: ptr
+    on_post_process_dom: ptr
+    on_filter_url: ptr
+}
+
+// ---- Scanner helper structure ----
+struct Scanner {
+    s: string
+    len: int
+    pos: int
+}
+
+fn scan_eof(sc: *Scanner) -> bool {
+    return sc.pos >= sc.len
+}
+
+fn scan_peek(sc: *Scanner) -> int {
+    if sc.pos >= sc.len { return 0 }
+    return string.char_at_n(sc.s, sc.len, sc.pos) & 255
+}
+
+fn scan_peek_next(sc: *Scanner, offset: int) -> int {
+    if sc.pos + offset >= sc.len { return 0 }
+    return string.char_at_n(sc.s, sc.len, sc.pos + offset) & 255
+}
+
+fn scan_advance(sc: *Scanner) -> int {
+    if sc.pos >= sc.len { return 0 }
+    c = string.char_at_n(sc.s, sc.len, sc.pos) & 255
+    sc.pos = sc.pos + 1
+    return c
+}
+
+// ---- UTF-8 & Entity Decoding Helpers ----
+
+fn encode_utf8(cp: int) -> string {
+    if cp <= 0 { return "" }
+    if cp <= 0x7F {
+        return string_from_char(cp)
+    }
+    if cp <= 0x7FF {
+        b1 = 0xC0 | (cp >> 6)
+        b2 = 0x80 | (cp & 0x3F)
+        buf = bytes.new(3)
+        bytes.set(buf, 0, b1)
+        bytes.set(buf, 1, b2)
+        return bytes.finish(buf, 2)
+    }
+    if cp <= 0xFFFF {
+        b1 = 0xE0 | (cp >> 12)
+        b2 = 0x80 | ((cp >> 6) & 0x3F)
+        b3 = 0x80 | (cp & 0x3F)
+        buf = bytes.new(4)
+        bytes.set(buf, 0, b1)
+        bytes.set(buf, 1, b2)
+        bytes.set(buf, 2, b3)
+        return bytes.finish(buf, 3)
+    }
+    if cp <= 0x10FFFF {
+        b1 = 0xF0 | (cp >> 18)
+        b2 = 0x80 | ((cp >> 12) & 0x3F)
+        b3 = 0x80 | ((cp >> 6) & 0x3F)
+        b4 = 0x80 | (cp & 0x3F)
+        buf = bytes.new(5)
+        bytes.set(buf, 0, b1)
+        bytes.set(buf, 1, b2)
+        bytes.set(buf, 2, b3)
+        bytes.set(buf, 3, b4)
+        return bytes.finish(buf, 4)
+    }
+    return ""
+}
+
+fn decode_html_entities(s: string) -> string {
+    if s == "" { return "" }
+    len = string_length(s)
+    if string_contains(s, "&") == 0 {
+        return string_substring(s, 0, len)
+    }
+    sb = strbuilder.new(len)
+
+    // Hoisted local strings
+    ent = ""
+    decoded = ""
+    num_str = ""
+    hex_str = ""
+    err = ""
+
+    i = 0
+    while i < len {
+        c = string.char_at_n(s, len, i) & 255
+        if c == 38 { // '&'
+            // Scan for ';'
+            j = i + 1
+            found_semi = false
+            while j < len {
+                cj = string.char_at_n(s, len, j) & 255
+                if cj == 59 { // ';'
+                    found_semi = true
+                    break
+                }
+                if cj == 38 || cj == 60 || cj == 62 || cj == 32 { // '&', '<', '>', ' '
+                    break
+                }
+                j = j + 1
+            }
+            if found_semi {
+                ent = string.substring_n(s, len, i + 1, j)
+                decoded = ""
+                if ent == "amp" { decoded = "&" }
+                else if ent == "lt" { decoded = "<" }
+                else if ent == "gt" { decoded = ">" }
+                else if ent == "quot" { decoded = "\"" }
+                else if ent == "apos" { decoded = "'" }
+                else if string_starts_with(ent, "#") == 1 {
+                    num_str, _ = string.strip_prefix(ent, "#")
+                    cp = -1
+                    if string_starts_with(num_str, "x") == 1 || string_starts_with(num_str, "X") == 1 {
+                        hex_str, _ = string.strip_prefix(num_str, "x")
+                        if hex_str == "" {
+                            hex_str, _ = string.strip_prefix(num_str, "X")
+                        }
+                        val, err = string.to_int_radix(hex_str, 16)
+                        if err == "" { cp = val as int }
+                    } else {
+                        val, err = string.to_int(num_str)
+                        if err == "" { cp = val }
+                    }
+                    if cp >= 0 {
+                        decoded = encode_utf8(cp)
+                    }
+                }
+
+                if decoded != "" {
+                    strbuilder.append(sb, decoded)
+                    i = j + 1
+                    continue
+                }
+            }
+        }
+        strbuilder.append_n(sb, string_from_char(c), 1)
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+fn html_escape(s: string, is_attr: bool) -> string {
+    if s == "" { return "" }
+    len = string_length(s)
+    sb = strbuilder.new(len + 10)
+    i = 0
+    while i < len {
+        c = string.char_at_n(s, len, i) & 255
+        if c == 38 { strbuilder.append(sb, "&amp;") }
+        else if c == 60 { strbuilder.append(sb, "&lt;") }
+        else if c == 62 { strbuilder.append(sb, "&gt;") }
+        else if c == 34 {
+            if is_attr { strbuilder.append(sb, "&quot;") }
+            else { strbuilder.append(sb, "\"") }
+        }
+        else if c == 39 {
+            if is_attr { strbuilder.append(sb, "&#x27;") }
+            else { strbuilder.append(sb, "'") }
+        }
+        else {
+            strbuilder.append_n(sb, string_from_char(c), 1)
+        }
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+// ---- DOM Creation & Memory Helpers ----
+
+fn new_doc_node() -> ptr {
+    n = heap.new(DomNode)
+    n.kind = NODE_DOC
+    n.name = ""
+    n.value = ""
+    n.attrs = list.new()
+    n.children = list.new()
+    n.parent = null
+    return n
+}
+
+fn new_elem_node(name: string) -> ptr {
+    n = heap.new(DomNode)
+    n.kind = NODE_ELEM
+    n.name = string_to_lower(name)
+    n.value = ""
+    n.attrs = list.new()
+    n.children = list.new()
+    n.parent = null
+    return n
+}
+
+fn new_text_node(val: string) -> ptr {
+    n = heap.new(DomNode)
+    n.kind = NODE_TEXT
+    n.name = ""
+    n.value = val
+    n.attrs = list.new()
+    n.children = list.new()
+    n.parent = null
+    return n
+}
+
+fn new_comment_node(val: string) -> ptr {
+    n = heap.new(DomNode)
+    n.kind = NODE_COMMENT
+    n.name = ""
+    n.value = val
+    n.attrs = list.new()
+    n.children = list.new()
+    n.parent = null
+    return n
+}
+
+fn new_attr(name: string, val: string) -> ptr {
+    a = heap.new(DomAttr)
+    a.name = string_to_lower(name)
+    a.value = val
+    return a
+}
+
+fn free_node(n: ptr) {
+    if n == null { return }
+    nd = n as *DomNode
+    if nd.attrs != null {
+        sz = list_size(nd.attrs)
+        i = 0
+        while i < sz {
+            a_ptr = list_get_raw(nd.attrs, i)
+            if a_ptr != null {
+                a = a_ptr as *DomAttr
+                heap.free(a)
+            }
+            i = i + 1
+        }
+        list_free(nd.attrs)
+    }
+    if nd.children != null {
+        sz = list_size(nd.children)
+        i = 0
+        while i < sz {
+            child_ptr = list_get_raw(nd.children, i)
+            if child_ptr != null {
+                free_node(child_ptr)
+            }
+            i = i + 1
+        }
+        list_free(nd.children)
+    }
+    heap.free(nd)
+}
+
+// ---- HTML Parser Implementation ----
+
+fn parse_html(html: string) -> ptr {
+    doc = new_doc_node()
+    sc = heap.new(Scanner)
+    sc.s = html
+    sc.len = string_length(html)
+    sc.pos = 0
+
+    stack = list_new()
+    list_add_raw(stack, doc)
+
+    // Hoisted local strings
+    raw_text_mode_tag = ""
+    text_val = ""
+    comment_val = ""
+    cdata_val = ""
+    tag_name = ""
+    attr_name = ""
+    attr_val = ""
+    decoded_attr_val = ""
+    decoded_txt = ""
+    txt = ""
+
+    while scan_eof(sc) == false {
+        if raw_text_mode_tag != "" {
+            start_pos = sc.pos
+            found_end = false
+            end_pos = sc.pos
+
+            while scan_eof(sc) == false {
+                if scan_peek(sc) == 60 && scan_peek_next(sc, 1) == 47 { // `</`
+                    match_tag = true
+                    tag_len = string_length(raw_text_mode_tag)
+                    j = 0
+                    while j < tag_len {
+                        c_tag = string.char_at_n(raw_text_mode_tag, tag_len, j) & 255
+                        c_sc = scan_peek_next(sc, 2 + j)
+                        if string_to_lower(string_from_char(c_sc)) != string_to_lower(string_from_char(c_tag)) {
+                            match_tag = false
+                            break
+                        }
+                        j = j + 1
+                    }
+                    if match_tag {
+                        next_c = scan_peek_next(sc, 2 + tag_len)
+                        if next_c == 62 || next_c == 32 || next_c == 9 || next_c == 10 || next_c == 13 || next_c == 47 {
+                            end_pos = sc.pos
+                            found_end = true
+                            break
+                        }
+                    }
+                }
+                scan_advance(sc)
+            }
+
+            text_val = ""
+            if found_end {
+                text_val = string.substring_n(sc.s, sc.len, start_pos, end_pos)
+            } else {
+                text_val = string.substring_n(sc.s, sc.len, start_pos, sc.pos)
+            }
+            if text_val != "" {
+                top_text = list_get_raw(stack, list_size(stack) - 1)
+                t_node = new_text_node(text_val)
+                (t_node as *DomNode).parent = top_text
+                list_add_raw((top_text as *DomNode).children, t_node)
+            }
+
+            if found_end {
+                sc.pos = end_pos + 2 + string_length(raw_text_mode_tag)
+                while scan_eof(sc) == false {
+                    cj = scan_peek(sc)
+                    if cj == 32 || cj == 9 || cj == 10 || cj == 13 {
+                        scan_advance(sc)
+                    } else {
+                        break
+                    }
+                }
+                if scan_peek(sc) == 62 {
+                    scan_advance(sc)
+                }
+                list_remove(stack, list_size(stack) - 1)
+                raw_text_mode_tag = ""
+            }
+            continue
+        }
+
+        c = scan_peek(sc)
+        if c == 60 { // `<`
+            if scan_peek_next(sc, 1) == 33 && scan_peek_next(sc, 2) == 45 && scan_peek_next(sc, 3) == 45 { // `<!--`
+                sc.pos = sc.pos + 4
+                start_c = sc.pos
+                while scan_eof(sc) == false {
+                    if scan_peek(sc) == 45 && scan_peek_next(sc, 1) == 45 && scan_peek_next(sc, 2) == 62 { // `-->`
+                        break
+                    }
+                    scan_advance(sc)
+                }
+                comment_val = string.substring_n(sc.s, sc.len, start_c, sc.pos)
+                if scan_eof(sc) == false {
+                    sc.pos = sc.pos + 3
+                }
+                top_comment = list_get_raw(stack, list_size(stack) - 1)
+                c_node = new_comment_node(comment_val)
+                (c_node as *DomNode).parent = top_comment
+                list_add_raw((top_comment as *DomNode).children, c_node)
+                continue
+            }
+
+            if scan_peek_next(sc, 1) == 33 && scan_peek_next(sc, 2) == 91 { // `<![`
+                is_cdata = true
+                cdata_str = "CDATA["
+                cdata_len = string_length(cdata_str)
+                j = 0
+                while j < cdata_len {
+                    if scan_peek_next(sc, 3 + j) != (string.char_at_n(cdata_str, cdata_len, j) & 255) {
+                        is_cdata = false
+                        break
+                    }
+                    j = j + 1
+                }
+                if is_cdata {
+                    sc.pos = sc.pos + 3 + cdata_len
+                    start_cd = sc.pos
+                    while scan_eof(sc) == false {
+                        if scan_peek(sc) == 93 && scan_peek_next(sc, 1) == 93 && scan_peek_next(sc, 2) == 62 { // `]]>`
+                            break
+                        }
+                        scan_advance(sc)
+                    }
+                    cdata_val = string.substring_n(sc.s, sc.len, start_cd, sc.pos)
+                    if scan_eof(sc) == false {
+                        sc.pos = sc.pos + 3
+                    }
+                    top_cdata = list_get_raw(stack, list_size(stack) - 1)
+                    t_node = new_text_node(cdata_val)
+                    (t_node as *DomNode).parent = top_cdata
+                    list_add_raw((top_cdata as *DomNode).children, t_node)
+                    continue
+                }
+            }
+
+            if scan_peek_next(sc, 1) == 47 { // `</`
+                sc.pos = sc.pos + 2
+                start_tag = sc.pos
+                while scan_eof(sc) == false {
+                    cj = scan_peek(sc)
+                    if (cj >= 97 && cj <= 122) || (cj >= 65 && cj <= 90) || (cj >= 48 && cj <= 57) || cj == 58 || cj == 45 || cj == 95 {
+                        scan_advance(sc)
+                    } else {
+                        break
+                    }
+                }
+                tag_name = string_to_lower(string.substring_n(sc.s, sc.len, start_tag, sc.pos))
+                while scan_eof(sc) == false && scan_peek(sc) != 62 {
+                    scan_advance(sc)
+                }
+                if scan_eof(sc) == false {
+                    scan_advance(sc)
+                }
+
+                if tag_name != "" {
+                    found_idx = -1
+                    st_sz = list_size(stack)
+                    k = st_sz - 1
+                    while k >= 1 {
+                        node = list_get_raw(stack, k)
+                        if (node as *DomNode).name == tag_name {
+                            found_idx = k
+                            break
+                        }
+                        k = k - 1
+                    }
+                    if found_idx >= 1 {
+                        while list_size(stack) > found_idx {
+                            list_remove(stack, list_size(stack) - 1)
+                        }
+                    }
+                }
+                continue
+            }
+
+            next_c = scan_peek_next(sc, 1)
+            if (next_c >= 97 && next_c <= 122) || (next_c >= 65 && next_c <= 90) || next_c == 63 || next_c == 33 {
+                scan_advance(sc)
+
+                start_tag = sc.pos
+                while scan_eof(sc) == false {
+                    cj = scan_peek(sc)
+                    if (cj >= 97 && cj <= 122) || (cj >= 65 && cj <= 90) || (cj >= 48 && cj <= 57) || cj == 58 || cj == 45 || cj == 95 || cj == 63 || cj == 33 {
+                        scan_advance(sc)
+                    } else {
+                        break
+                    }
+                }
+                tag_name = string_to_lower(string.substring_n(sc.s, sc.len, start_tag, sc.pos))
+
+                elem = new_elem_node(tag_name)
+
+                while scan_eof(sc) == false {
+                    while scan_eof(sc) == false {
+                        cj = scan_peek(sc)
+                        if cj == 32 || cj == 9 || cj == 10 || cj == 13 {
+                            scan_advance(sc)
+                        } else {
+                            break
+                        }
+                    }
+
+                    cj = scan_peek(sc)
+                    if cj == 62 || cj == 47 || cj == 0 {
+                        break
+                    }
+
+                    start_attr = sc.pos
+                    while scan_eof(sc) == false {
+                        cx = scan_peek(sc)
+                        if cx == 61 || cx == 62 || cx == 47 || cx == 32 || cx == 9 || cx == 10 || cx == 13 || cx == 0 {
+                            break
+                        }
+                        scan_advance(sc)
+                    }
+                    attr_name = string_to_lower(string.substring_n(sc.s, sc.len, start_attr, sc.pos))
+
+                    if attr_name != "" {
+                        attr_val = ""
+                        while scan_eof(sc) == false {
+                            cx = scan_peek(sc)
+                            if cx == 32 || cx == 9 || cx == 10 || cx == 13 {
+                                scan_advance(sc)
+                            } else {
+                                break
+                            }
+                        }
+                        if scan_peek(sc) == 61 {
+                            scan_advance(sc)
+                            while scan_eof(sc) == false {
+                                cx = scan_peek(sc)
+                                if cx == 32 || cx == 9 || cx == 10 || cx == 13 {
+                                    scan_advance(sc)
+                                } else {
+                                    break
+                                }
+                            }
+
+                            cx = scan_peek(sc)
+                            if cx == 34 {
+                                scan_advance(sc)
+                                start_val = sc.pos
+                                while scan_eof(sc) == false && scan_peek(sc) != 34 {
+                                    scan_advance(sc)
+                                }
+                                attr_val = string.substring_n(sc.s, sc.len, start_val, sc.pos)
+                                if scan_eof(sc) == false {
+                                    scan_advance(sc)
+                                }
+                            } else if cx == 39 {
+                                scan_advance(sc)
+                                start_val = sc.pos
+                                while scan_eof(sc) == false && scan_peek(sc) != 39 {
+                                    scan_advance(sc)
+                                }
+                                attr_val = string.substring_n(sc.s, sc.len, start_val, sc.pos)
+                                if scan_eof(sc) == false {
+                                    scan_advance(sc)
+                                }
+                            } else {
+                                start_val = sc.pos
+                                while scan_eof(sc) == false {
+                                    cy = scan_peek(sc)
+                                    if cy == 32 || cy == 9 || cy == 10 || cy == 13 || cy == 62 || cy == 47 || cy == 0 {
+                                        break
+                                    }
+                                    scan_advance(sc)
+                                }
+                                attr_val = string.substring_n(sc.s, sc.len, start_val, sc.pos)
+                            }
+                        }
+
+                        decoded_attr_val = decode_html_entities(attr_val)
+                        list_add_raw((elem as *DomNode).attrs, new_attr(attr_name, decoded_attr_val))
+                    }
+                }
+
+                is_self_closing = false
+                while scan_eof(sc) == false {
+                    cj = scan_peek(sc)
+                    if cj == 32 || cj == 9 || cj == 10 || cj == 13 {
+                        scan_advance(sc)
+                    } else {
+                        break
+                    }
+                }
+                if scan_peek(sc) == 47 {
+                    scan_advance(sc)
+                    is_self_closing = true
+                }
+                if scan_peek(sc) == 62 {
+                    scan_advance(sc)
+                }
+
+                if tag_name == "area" || tag_name == "base" || tag_name == "br" || tag_name == "col" ||
+                   tag_name == "embed" || tag_name == "hr" || tag_name == "img" || tag_name == "input" ||
+                   tag_name == "link" || tag_name == "meta" || tag_name == "param" || tag_name == "source" ||
+                   tag_name == "track" || tag_name == "wbr" {
+                    is_self_closing = true
+                }
+
+                top_elem = list_get_raw(stack, list_size(stack) - 1)
+                (elem as *DomNode).parent = top_elem
+                list_add_raw((top_elem as *DomNode).children, elem)
+
+                if is_self_closing == false {
+                    list_add_raw(stack, elem)
+                    if tag_name == "script" || tag_name == "style" || tag_name == "iframe" || tag_name == "noscript" || tag_name == "textarea" {
+                        raw_text_mode_tag = tag_name
+                    }
+                }
+                continue
+            }
+        }
+
+        start_txt = sc.pos
+        while scan_eof(sc) == false {
+            if scan_peek(sc) == 60 {
+                break
+            }
+            scan_advance(sc)
+        }
+        txt = string.substring_n(sc.s, sc.len, start_txt, sc.pos)
+        if txt != "" {
+            decoded_txt = decode_html_entities(txt)
+            top_ptxt = list_get_raw(stack, list_size(stack) - 1)
+            t_node = new_text_node(decoded_txt)
+            (t_node as *DomNode).parent = top_ptxt
+            list_add_raw((top_ptxt as *DomNode).children, t_node)
+        }
+    }
+
+    list_free(stack)
+    heap.free(sc)
+    return doc
+}
+
+// ---- HTML Formatting/Serialization ----
+
+fn html_format_rec(n: ptr, sb: ptr) {
+    if n == null { return }
+    nd = n as *DomNode
+    if nd.kind == NODE_DOC {
+        sz = list_size(nd.children)
+        i = 0
+        while i < sz {
+            child = list_get_raw(nd.children, i)
+            html_format_rec(child, sb)
+            i = i + 1
+        }
+    } else if nd.kind == NODE_ELEM {
+        strbuilder.append(sb, "<")
+        strbuilder.append(sb, nd.name)
+
+        sz = list_size(nd.attrs)
+        i = 0
+        while i < sz {
+            attr_ptr = list_get_raw(nd.attrs, i)
+            if attr_ptr != null {
+                a = attr_ptr as *DomAttr
+                strbuilder.append(sb, " ")
+                strbuilder.append(sb, a.name)
+                strbuilder.append(sb, "=\"")
+                strbuilder.append(sb, html_escape(a.value, true))
+                strbuilder.append(sb, "\"")
+            }
+            i = i + 1
+        }
+
+        is_void = nd.name == "area" || nd.name == "base" || nd.name == "br" || nd.name == "col" ||
+                  nd.name == "embed" || nd.name == "hr" || nd.name == "img" || nd.name == "input" ||
+                  nd.name == "link" || nd.name == "meta" || nd.name == "param" || nd.name == "source" ||
+                  nd.name == "track" || nd.name == "wbr"
+
+        if is_void {
+            strbuilder.append(sb, ">")
+        } else {
+            strbuilder.append(sb, ">")
+            child_sz = list_size(nd.children)
+            j = 0
+            while j < child_sz {
+                child = list_get_raw(nd.children, j)
+                html_format_rec(child, sb)
+                j = j + 1
+            }
+            strbuilder.append(sb, "</")
+            strbuilder.append(sb, nd.name)
+            strbuilder.append(sb, ">")
+        }
+    } else if nd.kind == NODE_TEXT {
+        is_raw = false
+        if nd.parent != null {
+            p = nd.parent as *DomNode
+            if p.name == "script" || p.name == "style" {
+                is_raw = true
+            }
+        }
+        if is_raw {
+            strbuilder.append(sb, nd.value)
+        } else {
+            strbuilder.append(sb, html_escape(nd.value, false))
+        }
+    } else if nd.kind == NODE_COMMENT {
+        strbuilder.append(sb, "<!--")
+        strbuilder.append(sb, nd.value)
+        strbuilder.append(sb, "-->")
+    }
+}
+
+fn html_format(n: ptr) -> string {
+    sb = strbuilder.new(1024)
+    html_format_rec(n, sb)
+    return strbuilder.finish(sb)
+}
+
+// ---- CSS & URL Helper Implementations ----
+
+fn get_scheme(url: string) -> string {
+    len = string_length(url)
+    colon = string_index_of(url, ":")
+    if colon <= 0 { return "" }
+
+    // Check first char
+    c0 = string.char_at_n(url, len, 0) & 255
+    if !((c0 >= 97 && c0 <= 122) || (c0 >= 65 && c0 <= 90)) {
+        return ""
+    }
+
+    i = 1
+    while i < colon {
+        c = string.char_at_n(url, len, i) & 255
+        if !((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46) {
+            return ""
+        }
+        i = i + 1
+    }
+    return string_to_lower(string.substring_n(url, len, 0, colon))
+}
+
+fn get_origin(url: string) -> string {
+    len = string_length(url)
+    sch = get_scheme(url)
+    if sch == "" { return "" }
+
+    prefix = string.concat(sch, "://")
+    prefix_len = string_length(prefix)
+    if string_starts_with(url, prefix) != 1 {
+        return ""
+    }
+
+    i = prefix_len
+    while i < len {
+        c = string.char_at_n(url, len, i) & 255
+        if c == 47 || c == 63 || c == 35 {
+            break
+        }
+        i = i + 1
+    }
+    return string.substring_n(url, len, 0, i)
+}
+
+fn normalize_path(path: string) -> string {
+    parts = string_split_to_seq(path, "/")
+    out_seq = string_seq_empty()
+
+    curr = parts
+    while string_seq_is_empty(curr) == 0 {
+        seg = string_seq_head(curr)
+        if seg == "." || seg == "" {
+            // skip
+        } else if seg == ".." {
+            if string_seq_is_empty(out_seq) == 0 {
+                out_seq = string_seq_tail(out_seq)
+            }
+        } else {
+            out_seq = string_seq_cons(seg, out_seq)
+        }
+        curr = string_seq_tail(curr)
+    }
+
+    out_seq = string_seq_reverse(out_seq)
+    joined = string_seq_join(out_seq, "/")
+
+    string_seq_free(parts)
+    string_seq_free(out_seq)
+    return joined
+}
+
+fn resolve_url(base_url: string, rel_url: string) -> string {
+    if base_url == "" { return rel_url }
+
+    sch = get_scheme(rel_url)
+    if sch != "" { return rel_url }
+
+    if string_starts_with(rel_url, "//") == 1 {
+        base_sch = get_scheme(base_url)
+        if base_sch != "" {
+            return string.concat(string.concat(base_sch, ":"), rel_url)
+        }
+        return rel_url
+    }
+
+    if string_starts_with(rel_url, "/") == 1 {
+        origin = get_origin(base_url)
+        if origin != "" {
+            return string.concat(origin, rel_url)
+        }
+        return rel_url
+    }
+
+    base_len = string_length(base_url)
+    q = string_index_of(base_url, "?")
+    h = string_index_of(base_url, "#")
+    end = base_len
+    if q >= 0 && q < end { end = q }
+    if h >= 0 && h < end { end = h }
+
+    clean_base = string.substring_n(base_url, base_len, 0, end)
+    clean_base_len = string_length(clean_base)
+
+    last_slash = -1
+    i = clean_base_len - 1
+    while i >= 0 {
+        if (string.char_at_n(clean_base, clean_base_len, i) & 255) == 47 {
+            last_slash = i
+            break
+        }
+        i = i - 1
+    }
+
+    parent = ""
+    if last_slash >= 0 {
+        base_sch = get_scheme(clean_base)
+        prefix = string.concat(base_sch, "://")
+        prefix_len = string_length(prefix)
+        if last_slash < prefix_len {
+            parent = string.concat(clean_base, "/")
+        } else {
+            parent = string.substring_n(clean_base, clean_base_len, 0, last_slash + 1)
+        }
+    } else {
+        parent = string.concat(clean_base, "/")
+    }
+
+    joined = string.concat(parent, rel_url)
+
+    origin = get_origin(joined)
+    if origin != "" {
+        origin_len = string_length(origin)
+        path_part = string.substring_n(joined, string_length(joined), origin_len, string_length(joined))
+        norm_path = normalize_path(path_part)
+        res = string.concat(string.concat(origin, "/"), norm_path)
+        return res
+    }
+
+    return joined
+}
+
+fn normalize_css_escapes(s: string) -> string {
+    if s == "" { return "" }
+    len = string_length(s)
+    if string_contains(s, "\\") == 0 {
+        return string_substring(s, 0, len)
+    }
+    sb = strbuilder.new(len)
+    i = 0
+    while i < len {
+        c = string.char_at_n(s, len, i) & 255
+        if c == 92 { // '\\'
+            if i + 1 < len {
+                j = i + 1
+                while j < len && j - i <= 6 {
+                    cx = string.char_at_n(s, len, j) & 255
+                    if (cx >= 48 && cx <= 57) || (cx >= 97 && cx <= 102) || (cx >= 65 && cx <= 70) {
+                        j = j + 1
+                    } else {
+                        break
+                    }
+                }
+                if j > i + 1 {
+                    hex_str = string.substring_n(s, len, i + 1, j)
+                    val, _ = string.to_int_radix(hex_str, 16)
+                    strbuilder.append(sb, encode_utf8(val as int))
+                    i = j
+                    if i < len {
+                        cx = string.char_at_n(s, len, i) & 255
+                        if cx == 32 || cx == 9 || cx == 10 || cx == 13 {
+                            i = i + 1
+                        }
+                    }
+                    continue
+                } else {
+                    cx = string.char_at_n(s, len, i + 1) & 255
+                    strbuilder.append_n(sb, string_from_char(cx), 1)
+                    i = i + 2
+                    continue
+                }
+            }
+        }
+        strbuilder.append_n(sb, string_from_char(c), 1)
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+fn sanitize_css_url_in_value(val: string, s: *HtmlSanitizer, elem: ptr, base_url: string) -> (string, bool) {
+    if val == "" { return "", false }
+
+    norm = normalize_css_escapes(val)
+    norm_len = string_length(norm)
+
+    sb = strbuilder.new(norm_len + 10)
+    has_disallowed = false
+
+    // Hoisted local strings
+    raw_url = ""
+    resolved = ""
+    sch = ""
+    filtered_url = ""
+
+    i = 0
+    while i < norm_len {
+        c = string.char_at_n(norm, norm_len, i) & 255
+
+        is_url = false
+        if i + 3 < norm_len {
+            c0 = string.char_at_n(norm, norm_len, i) & 255
+            c1 = string.char_at_n(norm, norm_len, i + 1) & 255
+            c2 = string.char_at_n(norm, norm_len, i + 2) & 255
+            if (c0 == 117 || c0 == 85) && (c1 == 114 || c1 == 82) && (c2 == 108 || c2 == 76) {
+                j = i + 3
+                while j < norm_len {
+                    cx = string.char_at_n(norm, norm_len, j) & 255
+                    if cx == 32 || cx == 9 || cx == 10 || cx == 13 {
+                        j = j + 1
+                    } else {
+                        break
+                    }
+                }
+                if j < norm_len && (string.char_at_n(norm, norm_len, j) & 255) == 40 {
+                    is_url = true
+                    i = j
+                }
+            }
+        }
+
+        if is_url {
+            i = i + 1
+            start_url = i
+            while i < norm_len {
+                if (string.char_at_n(norm, norm_len, i) & 255) == 41 {
+                    break
+                }
+                i = i + 1
+            }
+            raw_url = string.substring_n(norm, norm_len, start_url, i)
+            if i < norm_len {
+                i = i + 1
+            }
+
+            raw_url = string_trim(raw_url)
+            if string_starts_with(raw_url, "\"") == 1 && string_ends_with(raw_url, "\"") == 1 {
+                raw_url = string.substring_n(raw_url, string_length(raw_url), 1, string_length(raw_url) - 1)
+            } else if string_starts_with(raw_url, "'") == 1 && string_ends_with(raw_url, "'") == 1 {
+                raw_url = string.substring_n(raw_url, string_length(raw_url), 1, string_length(raw_url) - 1)
+            }
+            raw_url = string_trim(raw_url)
+
+            if raw_url == "" {
+                strbuilder.append(sb, "url()")
+                continue
+            }
+
+            resolved = resolve_url(base_url, raw_url)
+
+            sch = get_scheme(resolved)
+            allowed = false
+            if sch == "" {
+                allowed = true
+            } else {
+                allowed = set.contains(s.allowed_schemes, sch)
+            }
+
+            if allowed == false {
+                has_disallowed = true
+                continue
+            }
+
+            if s.on_filter_url != null {
+                filtered_url = invoke_filter_url(s.on_filter_url, elem, raw_url, resolved)
+                if filtered_url == "" {
+                    has_disallowed = true
+                    continue
+                }
+                resolved = filtered_url
+            }
+
+            strbuilder.append(sb, "url(\"")
+            strbuilder.append(sb, resolved)
+            strbuilder.append(sb, "\")")
+            continue
+        }
+
+        strbuilder.append_n(sb, string_from_char(c), 1)
+        i = i + 1
+    }
+
+    return strbuilder.finish(sb), has_disallowed
+}
+
+fn sanitize_css_style_attribute(s: *HtmlSanitizer, elem: ptr, attr_ptr: ptr, base_url: string) -> bool {
+    attr = attr_ptr as *DomAttr
+    if attr.value == "" { return true }
+
+    parts = string_split_to_seq(attr.value, ";")
+    sb = strbuilder.new(string_length(attr.value))
+
+    // Hoisted local strings
+    decl = ""
+    prop_name = ""
+    prop_val = ""
+    san_val = ""
+
+    curr = parts
+    while string_seq_is_empty(curr) == 0 {
+        decl = string_seq_head(curr)
+        decl = string_trim(decl)
+        if decl != "" {
+            colon = string_index_of(decl, ":")
+            if colon > 0 {
+                prop_name = string_to_lower(string_trim(string.substring_n(decl, string_length(decl), 0, colon)))
+                prop_val = string_trim(string.substring_n(decl, string_length(decl), colon + 1, string_length(decl)))
+
+                allowed = set.contains(s.allowed_css_properties, prop_name)
+
+                // Allow custom CSS properties starting with `--`
+                if allowed == false && string_starts_with(prop_name, "--") == 1 {
+                    allowed = true
+                }
+
+                remove = !allowed
+                reason = REASON_NOT_ALLOWED_STYLE
+
+                if remove {
+                    if s.on_removing_style != null {
+                        cb = unbox_closure(s.on_removing_style)
+                        cancel = call(cb, elem, prop_name, prop_val, reason) != 0
+                        if cancel { remove = false }
+                    }
+                }
+
+                if remove == false {
+                    san_val, disallowed = sanitize_css_url_in_value(prop_val, s, elem, base_url)
+                    if disallowed {
+                        remove = true
+                        reason = REASON_NOT_ALLOWED_URL_VALUE
+                        if s.on_removing_style != null {
+                            cb = unbox_closure(s.on_removing_style)
+                            cancel = call(cb, elem, prop_name, prop_val, reason) != 0
+                            if cancel { remove = false }
+                        }
+                    } else {
+                        prop_val = san_val
+                    }
+                }
+
+                if remove == false {
+                    if s.disallow_css_property_value_regex != null {
+                        if regex.matches(s.disallow_css_property_value_regex, prop_val) == 1 {
+                            remove = true
+                        }
+                    }
+                }
+
+                if remove == false {
+                    strbuilder.append(sb, prop_name)
+                    strbuilder.append(sb, ": ")
+                    strbuilder.append(sb, prop_val)
+                    strbuilder.append(sb, "; ")
+                }
+            }
+        }
+        curr = string_seq_tail(curr)
+    }
+
+    string_seq_free(parts)
+    attr.value = string_trim(strbuilder.finish(sb))
+
+    if attr.value == "" {
+        return false
+    }
+    return true
+}
+
+fn sanitize_attributes(s: *HtmlSanitizer, elem: ptr, base_url: string) {
+    nd = elem as *DomNode
+    old_attrs = nd.attrs
+    new_attrs = list_new()
+
+    // Hoisted local strings
+    resolved = ""
+    filtered_url = ""
+
+    sz = list_size(old_attrs)
+    i = 0
+    while i < sz {
+        attr_ptr = list_get_raw(old_attrs, i)
+        if attr_ptr != null {
+            attr = attr_ptr as *DomAttr
+
+            allowed = set.contains(s.allowed_attributes, attr.name)
+            if allowed == false && s.allow_data_attributes && string_starts_with(attr.name, "data-") == 1 {
+                allowed = true
+            }
+
+            remove = !allowed
+            reason = REASON_NOT_ALLOWED_ATTRIBUTE
+
+            if remove {
+                if s.on_removing_attribute != null {
+                    cb = unbox_closure(s.on_removing_attribute)
+                    cancel = call(cb, elem, attr_ptr, reason) != 0
+                    if cancel { remove = false }
+                }
+            }
+
+            if remove == false {
+                if set.contains(s.uri_attributes, attr.name) {
+                    resolved = resolve_url(base_url, attr.value)
+                    sch = get_scheme(resolved)
+                    allowed_sch = false
+                    if sch == "" {
+                        allowed_sch = true
+                    } else {
+                        allowed_sch = set.contains(s.allowed_schemes, sch)
+                    }
+
+                    if allowed_sch == false {
+                        remove = true
+                        reason = REASON_NOT_ALLOWED_URL_VALUE
+                        if s.on_removing_attribute != null {
+                            cb = unbox_closure(s.on_removing_attribute)
+                            cancel = call(cb, elem, attr_ptr, reason) != 0
+                            if cancel { remove = false }
+                        }
+                    } else {
+                        if s.on_filter_url != null {
+                            filtered_url = invoke_filter_url(s.on_filter_url, elem, attr.value, resolved)
+                            if filtered_url == "" {
+                                remove = true
+                            } else {
+                                attr.value = filtered_url
+                            }
+                        } else {
+                            attr.value = resolved
+                        }
+                    }
+                } else if attr.name == "style" {
+                    keep_style = sanitize_css_style_attribute(s, elem, attr_ptr, base_url)
+                    if keep_style == false {
+                        remove = true
+                    }
+                }
+            }
+
+            if remove {
+                heap.free(attr)
+            } else {
+                list_add_raw(new_attrs, attr_ptr)
+            }
+        }
+        i = i + 1
+    }
+    list_free(old_attrs)
+    nd.attrs = new_attrs
+}
+
+fn sanitize_node(s: *HtmlSanitizer, node: ptr, base_url: string) -> bool {
+    nd = node as *DomNode
+    if nd.kind == NODE_TEXT {
+        return false
+    }
+
+    if nd.kind == NODE_COMMENT {
+        remove = true
+        if s.on_removing_comment != null {
+            cb = unbox_closure(s.on_removing_comment)
+            cancel = call(cb, node) != 0
+            if cancel { remove = false }
+        }
+        return remove
+    }
+
+    if nd.kind == NODE_ELEM {
+        allowed = set.contains(s.allowed_tags, nd.name)
+        remove = !allowed
+
+        if remove {
+            if s.on_removing_tag != null {
+                cb = unbox_closure(s.on_removing_tag)
+                cancel = call(cb, node, REASON_NOT_ALLOWED_TAG) != 0
+                if cancel { remove = false }
+            }
+        }
+
+        if remove == false {
+            sanitize_attributes(s, node, base_url)
+        }
+
+        return remove
+    }
+
+    return false
+}
+
+fn sanitize_children(s: *HtmlSanitizer, parent: ptr, base_url: string) {
+    p_node = parent as *DomNode
+    old_children = p_node.children
+    new_children = list_new()
+
+    sz = list_size(old_children)
+    i = 0
+    while i < sz {
+        child = list_get_raw(old_children, i)
+        if child != null {
+            remove_node = sanitize_node(s, child, base_url)
+            if remove_node {
+                if s.keep_child_nodes && (child as *DomNode).kind == NODE_ELEM {
+                    sanitize_children(s, child, base_url)
+
+                    c_ch = (child as *DomNode).children
+                    c_sz = list_size(c_ch)
+                    j = 0
+                    while j < c_sz {
+                        c_child = list_get_raw(c_ch, j)
+                        if c_child != null {
+                            (c_child as *DomNode).parent = parent
+                            list_add_raw(new_children, c_child)
+                        }
+                        j = j + 1
+                    }
+                    list_clear((child as *DomNode).children)
+                }
+                free_node(child)
+            } else {
+                sanitize_children(s, child, base_url)
+                list_add_raw(new_children, child)
+            }
+        }
+        i = i + 1
+    }
+    list_free(old_children)
+    p_node.children = new_children
+}
+
+fn post_process_node_rec(s: *HtmlSanitizer, node: ptr) {
+    if node == null { return }
+    nd = node as *DomNode
+
+    sz = list_size(nd.children)
+    i = 0
+    while i < sz {
+        child = list_get_raw(nd.children, i)
+        post_process_node_rec(s, child)
+        i = i + 1
+    }
+
+    if s.on_post_process_node != null {
+        cb = unbox_closure(s.on_post_process_node)
+        call(cb, node)
+    }
+}
+
+// ---- Lifecycle & Initialization ----
+
+fn populate_defaults(s: *HtmlSanitizer) {
+    set.add(s.allowed_schemes, "http")
+    set.add(s.allowed_schemes, "https")
+
+    set.add(s.uri_attributes, "action")
+    set.add(s.uri_attributes, "formaction")
+    set.add(s.uri_attributes, "background")
+    set.add(s.uri_attributes, "dynsrc")
+    set.add(s.uri_attributes, "href")
+    set.add(s.uri_attributes, "lowsrc")
+    set.add(s.uri_attributes, "src")
+
+    let tag_seq: *StringSeq = ["a", "abbr", "acronym", "address", "area", "b",
+        "big", "blockquote", "br", "button", "caption", "center", "cite",
+        "code", "col", "colgroup", "dd", "del", "dfn", "dir", "div", "dl", "dt",
+        "em", "fieldset", "font", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "hr", "i", "img", "input", "ins", "kbd", "label", "legend", "li", "map",
+        "menu", "ol", "optgroup", "option", "p", "pre", "q", "s", "samp",
+        "select", "small", "span", "strike", "strong", "sub", "sup", "table",
+        "tbody", "td", "textarea", "tfoot", "th", "thead", "tr", "tt", "u",
+        "ul", "var", "section", "nav", "article", "aside", "header", "footer", "main",
+        "figure", "figcaption", "data", "time", "mark", "ruby", "rt", "rp", "bdi", "wbr",
+        "datalist", "keygen", "output", "progress", "meter", "details", "summary", "menuitem",
+        "html", "head", "body", "svg", "rect"]
+
+    curr_tag = tag_seq
+    while string_seq_is_empty(curr_tag) == 0 {
+        set.add(s.allowed_tags, string_seq_head(curr_tag))
+        curr_tag = string_seq_tail(curr_tag)
+    }
+
+    let attr_seq: *StringSeq = ["abbr", "accept", "accept-charset", "accesskey",
+        "action", "align", "alt", "axis", "bgcolor", "border", "cellpadding",
+        "cellspacing", "char", "charoff", "charset", "checked", "cite",
+        "clear", "cols", "colspan", "color", "compact", "coords", "datetime",
+        "dir", "disabled", "enctype", "for", "frame", "headers", "height",
+        "href", "hreflang", "hspace", "ismap", "label", "lang",
+        "longdesc", "maxlength", "media", "method", "multiple", "name",
+        "nohref", "noshade", "nowrap", "prompt", "readonly", "rel", "rev",
+        "rows", "rowspan", "rules", "scope", "selected", "shape", "size",
+        "span", "src", "start", "style", "summary", "tabindex", "target", "title",
+        "type", "usemap", "valign", "value", "vspace", "width",
+        "high", "keytype", "list", "low", "max", "min", "novalidate", "open",
+        "optimum", "pattern", "placeholder", "pubdate", "radiogroup", "required",
+        "reversed", "spellcheck", "step", "wrap", "challenge", "contenteditable",
+        "draggable", "dropzone", "autocomplete", "autosave", "class", "id"]
+
+    curr_attr = attr_seq
+    while string_seq_is_empty(curr_attr) == 0 {
+        set.add(s.allowed_attributes, string_seq_head(curr_attr))
+        curr_attr = string_seq_tail(curr_attr)
+    }
+
+    let prop_seq: *StringSeq = ["align-content", "align-items", "align-self", "all", "animation",
+        "animation-delay", "animation-direction", "animation-duration",
+        "animation-fill-mode", "animation-iteration-count", "animation-name",
+        "animation-play-state", "animation-timing-function", "backface-visibility",
+        "background", "background-attachment", "background-blend-mode",
+        "background-clip", "background-color", "background-image",
+        "background-origin", "background-position", "background-position-x",
+        "background-position-y", "background-repeat", "background-repeat-x",
+        "background-repeat-y", "background-size", "border", "border-bottom",
+        "border-bottom-color", "border-bottom-left-radius",
+        "border-bottom-right-radius", "border-bottom-style", "border-bottom-width",
+        "border-collapse", "border-color", "border-image", "border-image-outset",
+        "border-image-repeat", "border-image-slice", "border-image-source",
+        "border-image-width", "border-left", "border-left-color",
+        "border-left-style", "border-left-width", "border-radius", "border-right",
+        "border-right-color", "border-right-style", "border-right-width",
+        "border-spacing", "border-style", "border-top", "border-top-color",
+        "border-top-left-radius", "border-top-right-radius", "border-top-style",
+        "border-top-width", "border-width", "bottom", "box-decoration-break",
+        "box-shadow", "box-sizing", "break-after", "break-before", "break-inside",
+        "caption-side", "caret-color", "clear", "clip", "color", "column-count",
+        "column-fill", "column-gap", "column-rule", "column-rule-color",
+        "column-rule-style", "column-rule-width", "column-span", "column-width",
+        "columns", "content", "counter-increment", "counter-reset", "cursor",
+        "direction", "display", "empty-cells", "filter", "flex", "flex-basis",
+        "flex-direction", "flex-flow", "flex-grow", "flex-shrink", "flex-wrap",
+        "float", "font", "font-family", "font-feature-settings", "font-kerning",
+        "font-language-override", "font-size", "font-size-adjust", "font-stretch",
+        "font-style", "font-synthesis", "font-variant", "font-variant-alternates",
+        "font-variant-caps", "font-variant-east-asian", "font-variant-ligatures",
+        "font-variant-numeric", "font-variant-position", "font-weight", "gap",
+        "grid", "grid-area", "grid-auto-columns", "grid-auto-flow", "grid-auto-rows",
+        "grid-column", "grid-column-end", "grid-column-gap", "grid-column-start",
+        "grid-gap", "grid-row", "grid-row-end", "grid-row-gap", "grid-row-start",
+        "grid-template", "grid-template-areas", "grid-template-columns",
+        "grid-template-rows", "hanging-punctuation", "height", "hyphens",
+        "image-rendering", "isolation", "justify-content", "left", "letter-spacing",
+        "line-break", "line-height", "list-style", "list-style-image",
+        "list-style-position", "list-style-type", "margin", "margin-bottom",
+        "margin-left", "margin-right", "margin-top", "mask", "mask-clip",
+        "mask-composite", "mask-image", "mask-mode", "mask-origin",
+        "mask-position", "mask-repeat", "mask-size", "mask-type", "max-height",
+        "max-width", "min-height", "min-width", "mix-blend-mode", "object-fit",
+        "object-position", "opacity", "order", "orphans", "outline",
+        "outline-color", "outline-offset", "outline-style", "outline-width",
+        "overflow", "overflow-wrap", "overflow-x", "overflow-y", "padding",
+        "padding-bottom", "padding-left", "padding-right", "padding-top",
+        "page-break-after", "page-break-before", "page-break-inside",
+        "perspective", "perspective-origin", "pointer-events", "position",
+        "quotes", "resize", "right", "row-gap", "scroll-behavior", "tab-size",
+        "table-layout", "text-align", "text-align-last", "text-combine-upright",
+        "text-decoration", "text-decoration-color", "text-decoration-line",
+        "text-decoration-skip", "text-decoration-style", "text-indent",
+        "text-justify", "text-orientation", "text-overflow", "text-shadow",
+        "text-transform", "text-underline-position", "top", "transform",
+        "transform-origin", "transform-style", "transition", "transition-delay",
+        "transition-duration", "transition-property", "transition-timing-function",
+        "unicode-bidi", "user-select", "vertical-align", "visibility",
+        "white-space", "widows", "width", "word-break", "word-spacing",
+        "word-wrap", "writing-mode", "z-index"]
+
+    curr_prop = prop_seq
+    while string_seq_is_empty(curr_prop) == 0 {
+        set.add(s.allowed_css_properties, string_seq_head(curr_prop))
+        curr_prop = string_seq_tail(curr_prop)
+    }
+}
+
+new() -> *HtmlSanitizer {
+    s = heap.new(HtmlSanitizer)
+    s.keep_child_nodes = false
+    s.allow_data_attributes = false
+    s.allowed_tags = set.new()
+    s.allowed_attributes = set.new()
+    s.allowed_css_properties = set.new()
+    s.allowed_schemes = set.new()
+    s.allowed_classes = set.new()
+    s.uri_attributes = set.new()
+    s.disallow_css_property_value_regex = null
+
+    s.on_removing_tag = null
+    s.on_removing_attribute = null
+    s.on_removing_style = null
+    s.on_removing_comment = null
+    s.on_removing_css_class = null
+    s.on_post_process_node = null
+    s.on_post_process_dom = null
+    s.on_filter_url = null
+
+    populate_defaults(s)
+    return s
+}
+
+free(s: *HtmlSanitizer) {
+    if s == null { return }
+    if s.allowed_tags != null { set.free(s.allowed_tags) }
+    if s.allowed_attributes != null { set.free(s.allowed_attributes) }
+    if s.allowed_css_properties != null { set.free(s.allowed_css_properties) }
+    if s.allowed_schemes != null { set.free(s.allowed_schemes) }
+    if s.allowed_classes != null { set.free(s.allowed_classes) }
+    if s.uri_attributes != null { set.free(s.uri_attributes) }
+    if s.disallow_css_property_value_regex != null { regex.free(s.disallow_css_property_value_regex) }
+
+    // Free callbacks
+    if s.on_removing_tag != null { heap.free(s.on_removing_tag) }
+    if s.on_removing_attribute != null { heap.free(s.on_removing_attribute) }
+    if s.on_removing_style != null { heap.free(s.on_removing_style) }
+    if s.on_removing_comment != null { heap.free(s.on_removing_comment) }
+    if s.on_removing_css_class != null { heap.free(s.on_removing_css_class) }
+    if s.on_post_process_node != null { heap.free(s.on_post_process_node) }
+    if s.on_post_process_dom != null { heap.free(s.on_post_process_dom) }
+    if s.on_filter_url != null { heap.free(s.on_filter_url) }
+
+    heap.free(s)
+}
+
+// ---- Core Sanitizer API ----
+
+sanitize(s: *HtmlSanitizer, html: string, base_url: string) -> string {
+    if html == "" { return "" }
+    doc = parse_html(html)
+    sanitize_children(s, doc, base_url)
+    post_process_node_rec(s, doc)
+
+    if s.on_post_process_dom != null {
+        cb = unbox_closure(s.on_post_process_dom)
+        call(cb, doc)
+    }
+
+    formatted = html_format(doc)
+    free_node(doc)
+    return formatted
+}
+
+sanitize_document(s: *HtmlSanitizer, html: string, base_url: string) -> string {
+    return sanitize(s, html, base_url)
+}
+
+sanitize_dom(s: *HtmlSanitizer, doc: ptr, context_node: ptr, base_url: string) -> ptr {
+    sanitize_children(s, doc, base_url)
+    post_process_node_rec(s, doc)
+
+    if s.on_post_process_dom != null {
+        cb = unbox_closure(s.on_post_process_dom)
+        call(cb, doc)
+    }
+    return doc
+}
+
+fn invoke_filter_url(cb: ptr, elem: ptr, raw_url: string, resolved_url: string) -> string {
+    c = unbox_closure(cb)
+    return call(c, elem, raw_url, resolved_url)
+}
