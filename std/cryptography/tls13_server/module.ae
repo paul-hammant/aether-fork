@@ -117,6 +117,9 @@ fn recio_next(r: *RecordIO) -> (ptr, int, string) {
         avail = r.len - r.off
         if avail >= 5 {
             plen = ((bytes.get(r.buf, r.off + 3) & 0xFF) << 8) | (bytes.get(r.buf, r.off + 4) & 0xFF)
+            if plen > 16640 {
+                return null, 0, "record: payload length exceeds maximum record size"
+            }
             total = 5 + plen
             if avail >= total {
                 rec = bytes.new(total)
@@ -401,6 +404,7 @@ accept(sock: ptr, cert_chain: ptr, cert_lens: ptr, priv_key: ptr, x25519_priv: p
     }
 
     if fin_ok == 0 {
+        tls13_client.send_alert_hs(sock, srv_hs_ctx, tls13_client.ALERT_LEVEL_FATAL, tls13_client.ALERT_DECRYPT_ERROR)
         bytes.free(th_sf); bytes.free(srnd); bytes.free(x25519_pub); bytes.free(shared); bytes.free(sh)
         tls13_hs.free_ch(&ch_parsed); bytes.free(ch_msg); tls13_client.transcript_free(tr); recio_free(rio)
         tls13_record.free_ctx(srv_hs_ctx); tls13_record.free_ctx(cli_hs_ctx)

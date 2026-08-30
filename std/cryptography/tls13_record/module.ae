@@ -67,6 +67,8 @@ const TAG_LEN = 16 // ChaCha20-Poly1305 / AES-GCM tag
 const RECORD_HEADER_LEN = 5 // opaque_type(1) + version(2) + length(2)
 const NONCE_LEN = 12
 const OPAQUE_APPLICATION_DATA = 0x17
+const CONTENT_MAX_PLAIN_LEN = 16384 // RFC 8446 §5.1: 2^14 bytes max fragment
+const RECORD_MAX_CIPHERTEXT_LEN = 16640 // 2^14 + 256 bytes max TLSCiphertext
 
 // A directional record context: the AEAD key, base iv, and a 64-bit sequence
 // number (the record sequence resets to 0 per key, per RFC 8446 §5.3).
@@ -158,6 +160,9 @@ fn build_aad(ct_len: int) -> ptr {
 // plaintext is content || content_type). Advances ctx.seq. Caller frees.
 seal_record(ctx: ptr, content_type: int, plaintext: ptr, pt_len: int) -> ptr {
     c = ctx as *RecordCtx
+    if ctx == null { return null }
+    if pt_len < 0 || pt_len > CONTENT_MAX_PLAIN_LEN { return null }
+    if c.seq < 0 || c.seq >= 0x7FFFFFFFFFFFFFFF { return null }
 
     // TLSInnerPlaintext = content || content_type (no padding in this cut).
     inner_len = pt_len + 1
@@ -222,7 +227,12 @@ open_record(ctx: ptr, record: ptr, rec_len: int, out: *OpenedRecord) -> string {
     out.plaintext = null
     out.plaintext_len = 0
 
+    if ctx == null { return "record: null context" }
     c = ctx as *RecordCtx
+    if c.seq < 0 || c.seq >= 0x7FFFFFFFFFFFFFFF {
+        return "record: sequence number overflow"
+    }
+
     if rec_len < RECORD_HEADER_LEN + TAG_LEN {
         return "record: too short"
     }
@@ -231,6 +241,9 @@ open_record(ctx: ptr, record: ptr, rec_len: int, out: *OpenedRecord) -> string {
         return "record: unexpected opaque_type"
     }
     ct_len = ((bytes.get(record, 3) & 0xFF) << 8) | (bytes.get(record, 4) & 0xFF)
+    if ct_len > RECORD_MAX_CIPHERTEXT_LEN {
+        return "record: length exceeds maximum record size"
+    }
     if RECORD_HEADER_LEN + ct_len > rec_len {
         return "record: length overruns buffer"
     }
@@ -245,6 +258,9 @@ open_record(ctx: ptr, record: ptr, rec_len: int, out: *OpenedRecord) -> string {
     bytes.copy_from_bytes(ctbuf, 0, record, RECORD_HEADER_LEN, ct_len)
 
     nonce = nonce_for(c.iv, c.seq)
+    // Advance sequence number per RFC 8446 §5.3 for every processed record
+    c.seq = c.seq + 1
+
     inner, err = aead_open_dispatch(c, nonce, aad, ctbuf, ct_len)
 
     bytes.free(aad)
@@ -272,7 +288,6 @@ open_record(ctx: ptr, record: ptr, rec_len: int, out: *OpenedRecord) -> string {
     if ct_idx < 0 {
         // all-zero inner plaintext: no content type -> illegal
         bytes.free(inner)
-        c.seq = c.seq + 1
         return "record: no content type (all-zero inner plaintext)"
     }
     out.content_type = bytes.get(inner, ct_idx) & 0xFF
@@ -286,6 +301,5 @@ open_record(ctx: ptr, record: ptr, rec_len: int, out: *OpenedRecord) -> string {
     out.plaintext_len = content_len
 
     bytes.free(inner)
-    c.seq = c.seq + 1
     return ""
 }

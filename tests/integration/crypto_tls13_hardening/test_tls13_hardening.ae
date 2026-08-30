@@ -1,0 +1,237 @@
+// BDD-style hardening and edge-case spec tests for TLS 1.3 client and server
+// Uses std.spec (describe / it / matchers)
+
+import std.spec
+import std.bytes
+import std.string
+import std.cryptography
+import std.cryptography.tls13_record(RecordCtx)
+import std.cryptography.tls13_record
+import std.cryptography.tls13_hs
+import std.cryptography.tls13_client
+import std.cryptography.tls13_server
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "TLS 1.3 Record Layer Hardening") {
+        spec.it("enforces maximum plaintext fragment size (16384 bytes)") callback {
+            key = bytes.new(32)
+            iv = bytes.new(12)
+            ctx = tls13_record.new_aead(tls13_record.AEAD_CHACHA20_POLY1305, key, 32, iv)
+
+            big_pt = bytes.new(16385)
+            rec = tls13_record.seal_record(ctx, tls13_record.CONTENT_APPLICATION_DATA, big_pt, 16385)
+            spec.assert_null(rec, "seal_record should fail for plaintext > 16384")
+
+            valid_pt = bytes.new(100)
+            valid_rec = tls13_record.seal_record(ctx, tls13_record.CONTENT_APPLICATION_DATA, valid_pt, 100)
+            spec.assert_not_null(valid_rec, "seal_record should succeed for valid plaintext size")
+
+            bytes.free(big_pt)
+            bytes.free(valid_pt)
+            bytes.free(valid_rec)
+            bytes.free(key)
+            bytes.free(iv)
+            tls13_record.free_ctx(ctx)
+        }
+
+        spec.it("enforces sequence number overflow protection") callback {
+            key = bytes.new(32)
+            iv = bytes.new(12)
+            ctx = tls13_record.new_aead(tls13_record.AEAD_CHACHA20_POLY1305, key, 32, iv)
+
+            // Manually set sequence number near max long
+            c = ctx as *RecordCtx
+            c.seq = 9223372036854775807 // 0x7FFFFFFFFFFFFFFF
+
+            pt = bytes.new(32)
+            rec = tls13_record.seal_record(ctx, tls13_record.CONTENT_APPLICATION_DATA, pt, 32)
+            spec.assert_null(rec, "seal_record should fail when sequence number overflows")
+
+            out = tls13_record.OpenedRecord { content_type: 0, plaintext: null, plaintext_len: 0 }
+            dummy_rec = bytes.new(30)
+            err = tls13_record.open_record(ctx, dummy_rec, 30, &out)
+            spec.assert_str_eq(err, "record: sequence number overflow", "open_record should reject overflowed sequence number")
+
+            bytes.free(pt)
+            bytes.free(dummy_rec)
+            bytes.free(key)
+            bytes.free(iv)
+            tls13_record.free_ctx(ctx)
+        }
+
+        spec.it("increments sequence number on open attempt even when decryption fails") callback {
+            key = bytes.new(32)
+            iv = bytes.new(12)
+            ctx = tls13_record.new_aead(tls13_record.AEAD_CHACHA20_POLY1305, key, 32, iv)
+
+            pt = bytes.new(16)
+            rec = tls13_record.seal_record(ctx, tls13_record.CONTENT_APPLICATION_DATA, pt, 16)
+
+            // Corrupt record ciphertext tag
+            bytes.set(rec, bytes.length(rec) - 1, (bytes.get(rec, bytes.length(rec) - 1) ^ 0xFF) & 0xFF)
+
+            c = ctx as *RecordCtx
+            c.seq = 0 // Reset sequence number to test increment
+
+            out = tls13_record.OpenedRecord { content_type: 0, plaintext: null, plaintext_len: 0 }
+            err = tls13_record.open_record(ctx, rec, bytes.length(rec), &out)
+            spec.assert_true(string.length(err) > 0, "open_record should return decryption error")
+            spec.assert_eq_long(c.seq, 1, "sequence number should still be incremented on open failure")
+
+            bytes.free(pt)
+            bytes.free(rec)
+            bytes.free(key)
+            bytes.free(iv)
+            tls13_record.free_ctx(ctx)
+        }
+
+        spec.it("rejects ciphertext records exceeding maximum record size (16640 bytes)") callback {
+            key = bytes.new(32)
+            iv = bytes.new(12)
+            ctx = tls13_record.new_aead(tls13_record.AEAD_CHACHA20_POLY1305, key, 32, iv)
+
+            // Construct oversized record header with ct_len = 17000
+            oversized = bytes.new(17005)
+            bytes.set(oversized, 0, 0x17)
+            bytes.set(oversized, 1, 0x03)
+            bytes.set(oversized, 2, 0x03)
+            bytes.set(oversized, 3, (17000 >> 8) & 0xFF)
+            bytes.set(oversized, 4, 17000 & 0xFF)
+
+            out = tls13_record.OpenedRecord { content_type: 0, plaintext: null, plaintext_len: 0 }
+            err = tls13_record.open_record(ctx, oversized, 17005, &out)
+            spec.assert_str_eq(err, "record: length exceeds maximum record size", "should reject ct_len > 16640")
+
+            bytes.free(oversized)
+            bytes.free(key)
+            bytes.free(iv)
+            tls13_record.free_ctx(ctx)
+        }
+    }
+
+    spec.describe(fw, "TLS 1.3 Handshake Codec Hardening") {
+        spec.it("detects duplicate extensions in ClientHello") callback {
+            rnd = bytes.new(32)
+            sid = bytes.new(32)
+            xpub = bytes.new(32)
+            // Build valid ClientHello
+            ch = tls13_hs.client_hello_full(rnd, sid, 32, tls13_hs.GROUP_X25519, xpub, 32, 0, null, 0, "test.com")
+            ch_len = bytes.length(ch)
+
+            // Inject a duplicate extension into the ClientHello extensions block
+            dup_ch = bytes.new(ch_len + 7)
+            bytes.copy_from_bytes(dup_ch, 0, ch, 0, ch_len)
+            // Update handshake body length in header
+            body_len = ((bytes.get(dup_ch, 1) & 0xFF) << 16) | ((bytes.get(dup_ch, 2) & 0xFF) << 8) | (bytes.get(dup_ch, 3) & 0xFF)
+            body_len = body_len + 7
+            bytes.set(dup_ch, 1, (body_len >> 16) & 0xFF)
+            bytes.set(dup_ch, 2, (body_len >> 8) & 0xFF)
+            bytes.set(dup_ch, 3, body_len & 0xFF)
+
+            // Update extensions total length in ClientHello (located before first extension)
+            // Find extensions total length position: search for total extension length in header
+            // In client_hello_full: body starts at offset 4.
+            // ext_len_pos is right after compression methods.
+            // Let's locate ext_len_pos: 4 + 2(legacy_ver) + 32(rnd) + 1 + 32(sid) + 2 + 6(cipher_suites) + 1 + 1(comp) = 81
+            ext_len_pos = 81
+            old_ext_tot = ((bytes.get(dup_ch, ext_len_pos) & 0xFF) << 8) | (bytes.get(dup_ch, ext_len_pos + 1) & 0xFF)
+            bytes.set(dup_ch, ext_len_pos, ((old_ext_tot + 7) >> 8) & 0xFF)
+            bytes.set(dup_ch, ext_len_pos + 1, (old_ext_tot + 7) & 0xFF)
+
+            // Append duplicate supported_versions extension (type 43 = 0x002b, body_len 3: list_len 2, version 0x0304)
+            bytes.set(dup_ch, ch_len, 0x00)
+            bytes.set(dup_ch, ch_len + 1, 0x2b)
+            bytes.set(dup_ch, ch_len + 2, 0x00)
+            bytes.set(dup_ch, ch_len + 3, 0x03)
+            bytes.set(dup_ch, ch_len + 4, 0x02)
+            bytes.set(dup_ch, ch_len + 5, 0x03)
+            bytes.set(dup_ch, ch_len + 6, 0x04)
+
+            parsed = tls13_hs.ChParsed { random: null, session_id: null, session_id_len: 0,
+                cipher_suite: 0, group: 0, key_share: null, key_share_len: 0,
+                has_sni: 0, saw_supported_versions: 0 }
+
+            err = tls13_hs.parse_client_hello(dup_ch, ch_len + 7, &parsed)
+            spec.assert_str_eq(err, "client hello: duplicate extension", "should reject ClientHello with duplicate extensions")
+
+            bytes.free(rnd); bytes.free(sid); bytes.free(xpub)
+            bytes.free(ch); bytes.free(dup_ch)
+            tls13_hs.free_ch(&parsed)
+        }
+
+        spec.it("detects duplicate extensions in ServerHello") callback {
+            rnd = bytes.new(32)
+            sid = bytes.new(32)
+            pub = bytes.new(32)
+            sh = tls13_hs.server_hello(rnd, sid, 32, tls13_hs.TLS_CHACHA20_POLY1305_SHA256, tls13_hs.GROUP_X25519, pub, 32)
+            sh_len = bytes.length(sh)
+
+            // Inject a duplicate extension (e.g. supported_versions 43 = 0x002b)
+            dup_sh = bytes.new(sh_len + 6)
+            bytes.copy_from_bytes(dup_sh, 0, sh, 0, sh_len)
+
+            body_len = ((bytes.get(dup_sh, 1) & 0xFF) << 16) | ((bytes.get(dup_sh, 2) & 0xFF) << 8) | (bytes.get(dup_sh, 3) & 0xFF)
+            body_len = body_len + 6
+            bytes.set(dup_sh, 1, (body_len >> 16) & 0xFF)
+            bytes.set(dup_sh, 2, (body_len >> 8) & 0xFF)
+            bytes.set(dup_sh, 3, body_len & 0xFF)
+
+            // Find extensions total length position in ServerHello:
+            // 4 + 2(legacy_ver) + 32(rnd) + 1 + 32(sid) + 2(cipher_suite) + 1(comp) = 74
+            ext_len_pos = 74
+            old_ext_tot = ((bytes.get(dup_sh, ext_len_pos) & 0xFF) << 8) | (bytes.get(dup_sh, ext_len_pos + 1) & 0xFF)
+            bytes.set(dup_sh, ext_len_pos, ((old_ext_tot + 6) >> 8) & 0xFF)
+            bytes.set(dup_sh, ext_len_pos + 1, (old_ext_tot + 6) & 0xFF)
+
+            // Append duplicate supported_versions ext
+            bytes.set(dup_sh, sh_len, 0x00)
+            bytes.set(dup_sh, sh_len + 1, 0x2b)
+            bytes.set(dup_sh, sh_len + 2, 0x00)
+            bytes.set(dup_sh, sh_len + 3, 0x02)
+            bytes.set(dup_sh, sh_len + 4, 0x03)
+            bytes.set(dup_sh, sh_len + 5, 0x04)
+
+            parsed = tls13_hs.ShParsed { version: 0, cipher_suite: 0, group: 0, key_share: null, key_share_len: 0, is_hello_retry: 0, psk_accepted: 0 }
+            err = tls13_hs.parse_server_hello(dup_sh, sh_len + 6, &parsed)
+            spec.assert_str_eq(err, "server hello: duplicate extension", "should reject ServerHello with duplicate extensions")
+
+            bytes.free(rnd); bytes.free(sid); bytes.free(pub)
+            bytes.free(sh); bytes.free(dup_sh)
+            if parsed.key_share != null { bytes.free(parsed.key_share) }
+        }
+
+        spec.it("rejects ServerHello with unsupported cipher suite or legacy_version") callback {
+            rnd = bytes.new(32)
+            sid = bytes.new(32)
+            pub = bytes.new(32)
+            sh = tls13_hs.server_hello(rnd, sid, 32, 0x0005, tls13_hs.GROUP_X25519, pub, 32) // cipher_suite 0x0005
+            sh_len = bytes.length(sh)
+
+            parsed = tls13_hs.ShParsed { version: 0, cipher_suite: 0, group: 0, key_share: null, key_share_len: 0, is_hello_retry: 0, psk_accepted: 0 }
+            err = tls13_hs.parse_server_hello(sh, sh_len, &parsed)
+            spec.assert_str_eq(err, "server hello: unsupported cipher suite", "should reject unsupported cipher suite")
+
+            bytes.free(rnd); bytes.free(sid); bytes.free(pub); bytes.free(sh)
+            if parsed.key_share != null { bytes.free(parsed.key_share) }
+        }
+    }
+
+    spec.describe(fw, "TLS 1.3 Alerts and Verification") {
+        spec.it("maps authentication errors to correct TLS Alert descriptions") callback {
+            spec.expect_int(tls13_client.alert_for_auth_error("certificate expired")).to_equal(tls13_client.ALERT_CERTIFICATE_EXPIRED)
+            spec.expect_int(tls13_client.alert_for_auth_error("hostname mismatch")).to_equal(tls13_client.ALERT_BAD_CERTIFICATE)
+            spec.expect_int(tls13_client.alert_for_auth_error("does not chain to a trusted anchor")).to_equal(tls13_client.ALERT_CERTIFICATE_UNKNOWN)
+            spec.expect_int(tls13_client.alert_for_auth_error("CertificateVerify signature invalid")).to_equal(tls13_client.ALERT_DECRYPT_ERROR)
+        }
+
+        spec.it("maps alert descriptions to human readable names") callback {
+            spec.expect_str(tls13_client.alert_name(tls13_client.ALERT_CLOSE_NOTIFY)).to_equal_str("close_notify")
+            spec.expect_str(tls13_client.alert_name(tls13_client.ALERT_DECRYPT_ERROR)).to_equal_str("decrypt_error")
+            spec.expect_str(tls13_client.alert_name(tls13_client.ALERT_HANDSHAKE_FAILURE)).to_equal_str("handshake_failure")
+        }
+    }
+
+    spec.run_summary(fw)
+}
