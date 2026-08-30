@@ -608,6 +608,18 @@ free_ch(c: *ChParsed) {
 // Suite and group selection happen here rather than in the caller because
 // both are "first offered thing we support", and doing it during the single
 // pass avoids keeping the whole offered list alive just to choose from it.
+fn ext_is_duplicate(seen_bitset: ptr, ext_type: int) -> int {
+    if ext_type < 0 || ext_type > 65535 { return 1 }
+    byte_idx = ext_type / 8
+    bit_mask = 1 << (ext_type % 8)
+    curr = bytes.get(seen_bitset, byte_idx) & 0xFF
+    if (curr & bit_mask) != 0 {
+        return 1
+    }
+    bytes.set(seen_bitset, byte_idx, (curr | bit_mask) & 0xFF)
+    return 0
+}
+
 parse_client_hello(msg: ptr, len: int, out: *ChParsed) -> string {
     out.random = null
     out.session_id = null
@@ -622,12 +634,13 @@ parse_client_hello(msg: ptr, len: int, out: *ChParsed) -> string {
     if len < 4 { return "client hello: truncated header" }
     if get8(msg, 0) != HS_CLIENT_HELLO { return "client hello: wrong msg type" }
     body_len = get24(msg, 1)
-    if body_len + 4 > len { return "client hello: length overruns buffer" }
+    if body_len > len - 4 { return "client hello: length overruns buffer" }
 
     p = 4
-    // legacy_version (2) -- always 0x0303 in TLS 1.3; the real version is in
-    // the supported_versions extension.
+    // legacy_version (2) -- must be >= 0x0301 for TLS 1.3
     if p + 2 > len { return "client hello: truncated version" }
+    leg_ver = get16(msg, p)
+    if leg_ver < 0x0301 { return "client hello: legacy_version unsupported" }
     p = p + 2
 
     // random[32]
@@ -657,7 +670,7 @@ parse_client_hello(msg: ptr, len: int, out: *ChParsed) -> string {
     if p + 2 > len { return "client hello: truncated cipher suites length" }
     cs_len = get16(msg, p)
     p = p + 2
-    if p + cs_len > len { return "client hello: cipher suites overrun" }
+    if cs_len < 2 || cs_len % 2 != 0 || cs_len > len - p { return "client hello: cipher suites overrun" }
     cs_end = p + cs_len
     while p + 1 < cs_end {
         cs = get16(msg, p)
@@ -671,25 +684,41 @@ parse_client_hello(msg: ptr, len: int, out: *ChParsed) -> string {
     p = cs_end
     if out.cipher_suite == 0 { return "client hello: no mutually supported cipher suite" }
 
-    // legacy_compression_methods<1..2^8-1> -- must contain only null(0).
+    // legacy_compression_methods<1..2^8-1> -- must contain null(0).
     if p + 1 > len { return "client hello: truncated compression" }
     comp_len = get8(msg, p)
     p = p + 1
-    if p + comp_len > len { return "client hello: compression overrun" }
+    if comp_len < 1 || comp_len > len - p { return "client hello: compression overrun" }
+    has_null_comp = 0
+    ci = 0
+    while ci < comp_len {
+        if get8(msg, p + ci) == 0 { has_null_comp = 1 }
+        ci = ci + 1
+    }
     p = p + comp_len
+    if has_null_comp == 0 { return "client hello: missing null compression method" }
 
     // extensions<8..2^16-1>
     if p + 2 > len { return "client hello: truncated extensions length" }
     ext_total = get16(msg, p)
     p = p + 2
+    if ext_total > len - p { return "client hello: extensions overrun" }
     ext_end = p + ext_total
-    if ext_end > len { return "client hello: extensions overrun" }
 
-    while p + 4 <= ext_end {
+    seen_exts = bytes.new(8192)
+    bytes.set(seen_exts, 8191, 0)
+    ext_err = ""
+
+    while p + 4 <= ext_end && string.equals(ext_err, "") == 1 {
         ext_type = get16(msg, p)
         ext_len = get16(msg, p + 2)
         d = p + 4
-        if d + ext_len > ext_end { return "client hello: extension overruns" }
+        if ext_len > ext_end - d { ext_err = "client hello: extension overruns"; break }
+
+        if ext_is_duplicate(seen_exts, ext_type) == 1 {
+            ext_err = "client hello: duplicate extension"
+            break
+        }
 
         if ext_type == 0x0000 {
             // server_name: presence is all a server needs here; the name
@@ -742,6 +771,9 @@ parse_client_hello(msg: ptr, len: int, out: *ChParsed) -> string {
         p = d + ext_len
     }
 
+    bytes.free(seen_exts)
+    if string.equals(ext_err, "") != 1 { return ext_err }
+
     if out.saw_supported_versions == 0 {
         return "client hello: no supported_versions offering TLS 1.3"
     }
@@ -767,11 +799,12 @@ parse_server_hello(msg: ptr, len: int, out: *ShParsed) -> string {
     if len < 4 { return "server hello: truncated header" }
     if get8(msg, 0) != HS_SERVER_HELLO { return "server hello: wrong msg type" }
     body_len = get24(msg, 1)
-    if body_len + 4 > len { return "server hello: length overruns buffer" }
+    if body_len > len - 4 { return "server hello: length overruns buffer" }
 
     p = 4
-    // legacy_version (2) — ignored, real version is in supported_versions
+    // legacy_version (2) — must be 0x0303 in TLS 1.3
     if p + 2 > len { return "server hello: truncated version" }
+    if get16(msg, p) != 0x0303 { return "server hello: bad legacy_version" }
     p = p + 2
     // random[32] — a HelloRetryRequest is a ServerHello whose random equals the
     // special SHA-256("HelloRetryRequest") sentinel (RFC 8446 §4.1.3).
@@ -781,11 +814,19 @@ parse_server_hello(msg: ptr, len: int, out: *ShParsed) -> string {
     // legacy_session_id_echo<0..32>
     if p + 1 > len { return "server hello: truncated session id len" }
     sid_len = get8(msg, p)
-    p = p + 1 + sid_len
+    p = p + 1
+    if sid_len > 32 || sid_len > len - p { return "server hello: session id overrun" }
+    p = p + sid_len
     // cipher_suite (2)
     if p + 2 > len { return "server hello: truncated cipher suite" }
     out.cipher_suite = get16(msg, p)
     p = p + 2
+    if out.cipher_suite != TLS_AES_128_GCM_SHA256 &&
+    out.cipher_suite != TLS_AES_256_GCM_SHA384 &&
+    out.cipher_suite != TLS_CHACHA20_POLY1305_SHA256 {
+        return "server hello: unsupported cipher suite"
+    }
+
     // legacy_compression_method (1) — must be 0
     if p + 1 > len { return "server hello: truncated compression" }
     if get8(msg, p) != 0 { return "server hello: nonzero compression method" }
@@ -794,32 +835,41 @@ parse_server_hello(msg: ptr, len: int, out: *ShParsed) -> string {
     if p + 2 > len { return "server hello: truncated extensions length" }
     ext_total = get16(msg, p)
     p = p + 2
+    if ext_total > len - p { return "server hello: extensions overrun" }
     ext_end = p + ext_total
-    if ext_end > len { return "server hello: extensions overrun" }
 
-    while p + 4 <= ext_end {
+    seen_exts = bytes.new(8192)
+    bytes.set(seen_exts, 8191, 0)
+    ext_err = ""
+
+    while p + 4 <= ext_end && string.equals(ext_err, "") == 1 {
         ext_type = get16(msg, p)
         ext_len = get16(msg, p + 2)
         p = p + 4
-        if p + ext_len > ext_end { return "server hello: extension overrun" }
+        if ext_len > ext_end - p { ext_err = "server hello: extension overrun"; break }
+
+        if ext_is_duplicate(seen_exts, ext_type) == 1 {
+            ext_err = "server hello: duplicate extension"
+            break
+        }
 
         if ext_type == 43 {
             // supported_versions (server form: single selected version)
-            if ext_len != 2 { return "server hello: bad supported_versions" }
+            if ext_len != 2 { ext_err = "server hello: bad supported_versions"; break }
             out.version = get16(msg, p)
         }
         if ext_type == 51 {
             if out.is_hello_retry == 1 {
                 // HRR key_share carries only the selected group (2 bytes),
                 // no key — it tells the client which group to retry with.
-                if ext_len < 2 { return "server hello: bad HRR key_share" }
+                if ext_len < 2 { ext_err = "server hello: bad HRR key_share"; break }
                 out.group = get16(msg, p)
             } else {
                 // key_share (server form: single KeyShareEntry {group, key<len>})
-                if ext_len < 4 { return "server hello: bad key_share" }
+                if ext_len < 4 { ext_err = "server hello: bad key_share"; break }
                 out.group = get16(msg, p)
                 ks_len = get16(msg, p + 2)
-                if 4 + ks_len > ext_len { return "server hello: key_share overrun" }
+                if 4 + ks_len > ext_len { ext_err = "server hello: key_share overrun"; break }
                 ks = bytes.new(ks_len)
                 if ks_len > 0 { bytes.set(ks, ks_len - 1, 0) }
                 j = 0
@@ -838,6 +888,9 @@ parse_server_hello(msg: ptr, len: int, out: *ShParsed) -> string {
         }
         p = p + ext_len
     }
+
+    bytes.free(seen_exts)
+    if string.equals(ext_err, "") != 1 { return ext_err }
 
     if out.version != 0x0304 {
         return "server hello: not TLS 1.3 (no supported_versions=0x0304)"

@@ -526,13 +526,14 @@ fn send_plaintext_handshake(sock: ptr, msg: ptr, msg_len: int) -> string {
 }
 
 // Fill a std.bytes buffer of length n with CSPRNG bytes.
+// Returns null on failure so callers can refuse and fail closed.
 fn rand_into(n: int) -> ptr {
     s, sn, err = cryptography.random_bytes(n)
+    if string.equals(err, "") != 1 { return null }
+    if sn < n { return null }
     b = bytes.new(n)
     if n > 0 { bytes.set(b, n - 1, 0) }
-    if string.equals(err, "") == 1 {
-        bytes.copy_from_string(b, 0, s, n)
-    }
+    bytes.copy_from_string(b, 0, s, n)
     return b
 }
 
@@ -649,12 +650,22 @@ fn connect_ex(host: string, port: int, x25519_priv: ptr, client_cert: ptr, clien
     // prefers P-256 completes without a HelloRetryRequest round-trip. We keep
     // the P-256 ephemeral private in case the server selects secp256r1.
     p256_priv = rand_into(32)
+    if p256_priv == null {
+        net.tcp_close(sock)
+        return null, "no randomness available for P-256 private key"
+    }
     x_pub, x_pub_len = keyshare_for_group(tls13_hs.GROUP_X25519, x25519_priv)
     p_pub, p_pub_len = keyshare_for_group(tls13_hs.GROUP_SECP256R1, p256_priv)
     pub = x_pub // primary keyshare (x25519); cleanup frees this
     pub_len = x_pub_len
     rnd = rand_into(32)
     sid = rand_into(32)
+    if rnd == null || sid == null {
+        if rnd != null { bytes.free(rnd) }
+        if sid != null { bytes.free(sid) }
+        bytes.free(p256_priv); bytes.free(p_pub); bytes.free(x_pub); net.tcp_close(sock)
+        return null, "no randomness available for ClientHello random/session_id"
+    }
     ch = tls13_hs.client_hello_full(rnd, sid, 32, tls13_hs.GROUP_X25519, x_pub, x_pub_len, tls13_hs.GROUP_SECP256R1, p_pub, p_pub_len, host)
     bytes.free(p_pub) // copied into the CH; keep only p256_priv
     ch_len = bytes.length(ch)
@@ -695,6 +706,11 @@ fn connect_ex(host: string, port: int, x25519_priv: ptr, client_cert: ptr, clien
         rp = null
         if retry_group == tls13_hs.GROUP_SECP256R1 {
             rp = rand_into(32)
+            if rp == null {
+                bytes.free(sh); bytes.free(shrec)
+                cleanup_hello(pub, rnd, sid, ch); transcript_free(tr); recio_free(rio); net.tcp_close(sock)
+                return null, "no randomness available for retry private key"
+            }
         } else {
             // Server asked to retry a group we don't support (or echoed x25519,
             // which shouldn't happen after a HRR); give up.
@@ -711,6 +727,13 @@ fn connect_ex(host: string, port: int, x25519_priv: ptr, client_cert: ptr, clien
         pub2, pub2_len = keyshare_for_group(cur_group, cur_priv)
         rnd = rand_into(32)
         sid = rand_into(32)
+        if rnd == null || sid == null {
+            if rnd != null { bytes.free(rnd) }
+            if sid != null { bytes.free(sid) }
+            bytes.free(pub2); bytes.free(cur_priv)
+            transcript_free(tr); recio_free(rio); net.tcp_close(sock)
+            return null, "no randomness available for retry ClientHello random/session_id"
+        }
         ch = tls13_hs.client_hello_full(rnd, sid, 32, cur_group, pub2, pub2_len, 0, null, 0, host)
         ch_len = bytes.length(ch)
         transcript_add(tr, ch, ch_len)
@@ -813,9 +836,20 @@ connect_pq(host: string, port: int) -> (ptr, string) {
     // scalar (keep to agree). Seeds from the CSPRNG.
     d = rand_into(32)
     z = rand_into(32)
+    xpriv = rand_into(32)
+    rnd = rand_into(32)
+    sid = rand_into(32)
+    if d == null || z == null || xpriv == null || rnd == null || sid == null {
+        if d != null { bytes.free(d) }
+        if z != null { bytes.free(z) }
+        if xpriv != null { bytes.free(xpriv) }
+        if rnd != null { bytes.free(rnd) }
+        if sid != null { bytes.free(sid) }
+        net.tcp_close(sock)
+        return null, "no randomness available for PQ key generation or ClientHello"
+    }
     ek, dk = mlkem.mlkem768_keygen(d, z)
     bytes.free(d); bytes.free(z)
-    xpriv = rand_into(32)
     xpub = x25519.base_point(xpriv)
 
     // Client hybrid share = ML-KEM ek(1184) || X25519 pub(32) = 1216 bytes.
@@ -824,9 +858,6 @@ connect_pq(host: string, port: int) -> (ptr, string) {
     bytes.set(hybrid, ek_len + 32 - 1, 0)
     bytes.copy_from_bytes(hybrid, 0, ek, 0, ek_len)
     bytes.copy_from_bytes(hybrid, ek_len, xpub, 0, 32)
-
-    rnd = rand_into(32)
-    sid = rand_into(32)
     ch = tls13_hs.client_hello_pq(rnd, sid, 32, hybrid, ek_len + 32, xpub, host)
     ch_len = bytes.length(ch)
     tr = transcript_new()
@@ -1022,6 +1053,10 @@ fn run_handshake_tail(sock: ptr, rio: ptr, tr: ptr, host: string,
                         // Certificate. ECDSA-P256 only in this cut.
                         th_ccv = transcript_hash_algo(tr, hash_algo)
                         knonce = rand_into(32)
+                        if knonce == null {
+                            bytes.free(th_ccv); bytes.free(ccert); bytes.free(ccert_rec)
+                            return null, "no randomness available for client signing nonce"
+                        }
                         cvsig = tls13_cert.sign_client_cert_verify_ecdsa_p256(client_key, th_ccv, hash_len, knonce)
                         ccv = build_cert_verify_msg(0x0403, cvsig, bytes.length(cvsig))
                         ccv_rec = tls13_record.seal_record(cli_hs_ctx, tls13_record.CONTENT_HANDSHAKE, ccv, bytes.length(ccv))
@@ -1667,6 +1702,12 @@ fn connect_resume_ed(host: string, port: int, x25519_priv: ptr, ticket: ptr, ear
     pub = x25519.base_point(x25519_priv)
     rnd = rand_into(32)
     sid = rand_into(32)
+    if rnd == null || sid == null {
+        if rnd != null { bytes.free(rnd) }
+        if sid != null { bytes.free(sid) }
+        bytes.free(psk); bytes.free(pub); net.tcp_close(sock)
+        return null, "no randomness available for resume ClientHello random/session_id"
+    }
 
     // Build the PSK ClientHello with a zero binder placeholder (+ early_data ext
     // when sending 0-RTT).
