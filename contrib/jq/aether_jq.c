@@ -13,6 +13,11 @@
  *
  * Everything else — lexer, parser, evaluator, builtins — is Aether.
  */
+/* pthread_getattr_np and pthread_attr_getstack are GNU extensions. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+#include <stdint.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,4 +182,91 @@ double aether_jq_modf_int(double x) {
     double ip = 0.0;
     modf(x, &ip);
     return ip;
+}
+
+/* How many bytes of C stack the calling thread has left, or -1 when the
+ * platform gives no way to ask. The evaluator recurses on the C stack
+ * (about 2 KiB per jq function call), so it checks this on every jq call
+ * and reports runaway recursion as a jq error instead of crashing. A fixed
+ * call-count cap cannot do that job: the same count that fits Linux's 8 MiB
+ * main-thread stack overflows Windows's 1 MiB one.
+ *
+ * The low end of the stack is looked up once per thread and cached. */
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+/* The reservation that holds this frame is the thread's stack; its base is
+ * the low end. VirtualQuery needs no minimum _WIN32_WINNT, unlike
+ * GetCurrentThreadStackLimits. */
+static uintptr_t jq_stack_low_lookup(void) {
+    MEMORY_BASIC_INFORMATION mbi;
+    volatile char probe = 0;
+    if (VirtualQuery((const void*)&probe, &mbi, sizeof(mbi)) == 0) return 0;
+    return (uintptr_t)mbi.AllocationBase;
+}
+#define JQ_HAVE_STACK_LOW 1
+#elif defined(__APPLE__)
+#include <pthread.h>
+static uintptr_t jq_stack_low_lookup(void) {
+    pthread_t self = pthread_self();
+    uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
+    return top - (uintptr_t)pthread_get_stacksize_np(self);
+}
+#define JQ_HAVE_STACK_LOW 1
+#elif defined(__linux__) && defined(__GLIBC__)
+#include <pthread.h>
+static uintptr_t jq_stack_low_lookup(void) {
+    pthread_attr_t attr;
+    void* addr = NULL;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) return 0;
+    pthread_attr_getstack(&attr, &addr, &size);
+    pthread_attr_destroy(&attr);
+    return (uintptr_t)addr;
+}
+#define JQ_HAVE_STACK_LOW 1
+#elif defined(__FreeBSD__)
+#include <pthread.h>
+#include <pthread_np.h>
+static uintptr_t jq_stack_low_lookup(void) {
+    pthread_attr_t attr;
+    void* addr = NULL;
+    size_t size = 0;
+    pthread_attr_init(&attr);
+    if (pthread_attr_get_np(pthread_self(), &attr) != 0) { pthread_attr_destroy(&attr); return 0; }
+    pthread_attr_getstack(&attr, &addr, &size);
+    pthread_attr_destroy(&attr);
+    return (uintptr_t)addr;
+}
+#define JQ_HAVE_STACK_LOW 1
+#endif
+
+#if defined(JQ_HAVE_STACK_LOW)
+#if defined(_MSC_VER)
+static __declspec(thread) uintptr_t jq_stack_low;
+static __declspec(thread) int jq_stack_low_known;
+#else
+static __thread uintptr_t jq_stack_low;
+static __thread int jq_stack_low_known;
+#endif
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+long long aether_jq_stack_remaining(void) {
+#if defined(JQ_HAVE_STACK_LOW)
+    volatile char marker = 0;
+    uintptr_t here = (uintptr_t)&marker;
+    if (!jq_stack_low_known) {
+        jq_stack_low = jq_stack_low_lookup();
+        jq_stack_low_known = 1;
+    }
+    if (jq_stack_low == 0 || here <= jq_stack_low) return -1;
+    return (long long)(here - jq_stack_low);
+#else
+    return -1;
+#endif
 }

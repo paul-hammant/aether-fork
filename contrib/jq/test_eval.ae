@@ -148,7 +148,9 @@ main() {
         spec.it("recursion, and nested definitions") callback {
             spec.assert_str_eq(jq_spec.yields("def fac: if . <= 1 then 1 else . * (. - 1 | fac) end; [range(1; 6) | fac]", "null"), "[1,2,6,24,120]", "recursion")
             spec.assert_str_eq(jq_spec.yields("def f: def g: 3; g * 2; f", "null"), "6", "nested def")
-            spec.assert_str_eq(jq_spec.fails_with("def f: . + 1 | f; f", "0"), "function call depth exceeded (3000) in f/0", "runaway recursion is an error, not a crash")
+            spec.assert_str_eq(jq_spec.yields("def f: if . < 200 then . + 1 | f else . end; f", "0"), "200", "bounded recursion runs to the end")
+            spec.assert_str_eq(jq_spec.fails_with("def f: . + 1 | f; f", "0"), "function call depth exceeded in f/0", "runaway recursion is an error, not a crash")
+            spec.assert_str_eq(jq_spec.fails_with("[recurse(. + 1)] | length", "0"), "function call depth exceeded in r/0", "a runaway prelude recursion is an error too")
         }
         spec.it("unknown functions are errors") callback {
             spec.assert_str_eq(jq_spec.fails_with("nosuch(1)", "null"), "nosuch/1 is not defined", "unknown")

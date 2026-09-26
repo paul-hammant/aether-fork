@@ -59,6 +59,7 @@ extern aether_jq_math2(op: int, x: float, y: float) -> float
 extern aether_jq_math3(op: int, x: float, y: float, z: float) -> float
 extern aether_jq_frexp_exp(x: float) -> int
 extern aether_jq_modf_int(x: float) -> float
+extern aether_jq_stack_remaining() -> long
 
 const ST_OK = 0
 const ST_ERROR = 1 // ctx.err holds the error value
@@ -1933,7 +1934,24 @@ _env_object(ctx: *Ctx) -> ptr {
     return o
 }
 
-const MAX_DEPTH = 3000
+// Runaway recursion must end in a jq error, not a C stack overflow. The
+// evaluator recurses on the C stack, about 2 KiB per jq call, so the guard
+// is the stack the thread has left: it stops while STACK_RESERVE bytes
+// remain for the error's own unwinding. Only where the platform cannot say
+// how much stack is left does a fixed call count stand in, set low enough
+// for a 1 MiB stack.
+const STACK_RESERVE = 262144
+const FALLBACK_MAX_DEPTH = 300
+
+_too_deep(depth: int) -> int {
+    left = aether_jq_stack_remaining()
+    if left < 0 {
+        if depth > FALLBACK_MAX_DEPTH { return 1 }
+        return 0
+    }
+    if left < STACK_RESERVE { return 1 }
+    return 0
+}
 
 _ev_call(ctx: *Ctx, n: *Node, node: ptr, input: ptr, env: ptr, sink: *Sink, p: ptr) {
     name = ast.name_of(node)
@@ -1958,9 +1976,9 @@ _ev_call(ctx: *Ctx, n: *Node, node: ptr, input: ptr, env: ptr, sink: *Sink, p: p
         return
     }
     ctx.depth = ctx.depth + 1
-    if ctx.depth > MAX_DEPTH {
+    if _too_deep(ctx.depth) != 0 {
         ctx.depth = ctx.depth - 1
-        _fail(ctx, "function call depth exceeded (${MAX_DEPTH}) in ${name}/${arity}")
+        _fail(ctx, "function call depth exceeded in ${name}/${arity}")
         return
     }
     def = f.node as *Node

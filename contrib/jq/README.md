@@ -102,8 +102,12 @@ Not supported:
 - Time zones: `localtime`, `strflocaltime` and `mktime` work in UTC.
   `strptime` understands the numeric directives and `%a %A %b %B %h %p %Z %z
   %s %T %R %F %D %%`.
-- Unbounded recursion: a jq function nested more than 3000 calls deep raises
-  `function call depth exceeded` instead of overflowing the C stack.
+- Unbounded recursion: the evaluator recurses on the C stack, about 2 KiB per
+  jq call. When less than 256 KiB of the thread's stack is left, a call
+  raises `function call depth exceeded` instead of overflowing it. The depth
+  that allows depends on the stack: around 3500 calls on an 8 MiB Linux main
+  thread, around 250 on a 1 MiB Windows one. Where the platform can't report
+  its stack, calls stop at 300 deep.
 
 ## How it is built
 
