@@ -219,8 +219,10 @@ int wasm_collect_export_names(const char* c_file, const char* explicit_list,
 int  run_cross_compile_obj(const char* c_file, const char* obj_file,
                            bool optimize, const char* ztriple);
 /* #1901: resolve [dependencies] from aether.toml onto the module search
- * path, honouring [patch] and --override. Safe with no manifest. */
-void ae_resolve_dependencies(void);
+ * path, honouring [patch] and --override. Safe with no manifest. Follows
+ * each dependency's own [dependencies] (#2335); returns the number of
+ * packages the graph resolves to two different directories. */
+int  ae_resolve_dependencies(void);
 void ae_dep_override_append(const char* spec);
 
 int  run_cross_build(const char* c_file, const char* out_file,

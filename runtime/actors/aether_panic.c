@@ -1,4 +1,5 @@
 #include "aether_panic.h"
+#include "../../std/string/aether_string.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -441,7 +442,14 @@ void aether_panic_owned(const char* reason, void (*release)(const void*)) {
     // frame reach the fallback. Suppress the trace via
     // AETHER_STACK_TRACE=0 if the noise gets in the way (e.g. tests
     // that diff stderr line-for-line).
-    fprintf(stderr, "aether: panic outside any try/catch or actor: %s\n", reason);
+    //
+    // `reason` is typed const char* but a heap-built message (an
+    // interpolation, a string built at run time) arrives as the
+    // AetherString* codegen hands over so a catch can adopt it. %s on
+    // that prints the header's magic bytes (#2340); aether_string_data
+    // unwraps it and passes a plain C string through unchanged.
+    fprintf(stderr, "aether: panic outside any try/catch or actor: %s\n",
+            aether_string_data(reason));
     const char* trace_env = getenv("AETHER_STACK_TRACE");
     if (!trace_env || strcmp(trace_env, "0") != 0) {
         aether_print_stack_trace_to_stderr();
@@ -545,5 +553,7 @@ void aether_set_on_actor_death(AetherDeathHook fn) {
 
 void aether_fire_death_hook(int actor_id, const char* reason) {
     AetherDeathHook h = death_hook;
-    if (h) h(actor_id, reason ? reason : "unknown");
+    // The hook's contract is a C string; a heap-built panic message is
+    // still the AetherString* the frame caught (#2340), so unwrap it.
+    if (h) h(actor_id, reason ? aether_string_data(reason) : "unknown");
 }

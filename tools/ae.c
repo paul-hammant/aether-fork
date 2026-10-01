@@ -1959,6 +1959,23 @@ static const char* dep_unwrap_patch_value(const char* v, char* buf, size_t bsz,
     return buf;
 }
 
+/* The [patch] entry for `name` in one manifest, or NULL. [patch] keys are
+ * quoted in the file exactly as [dependencies] keys are, and the parser keeps
+ * the quotes -- so look up both spellings rather than silently never
+ * matching. The returned pointer is into `buf` or the document. */
+static const char* dep_patch_in(TomlDocument* doc, const char* name,
+                                char* buf, size_t bsz) {
+    if (!doc) return NULL;
+    const char* p = toml_get_value(doc, "patch", name);
+    if (!p || !*p) {
+        char quoted[520];
+        snprintf(quoted, sizeof(quoted), "\"%s\"", name);
+        p = toml_get_value(doc, "patch", quoted);
+    }
+    if (!p || !*p) return NULL;
+    return dep_unwrap_patch_value(p, buf, bsz, name);
+}
+
 /* An override for `name`, from --override (highest) or the manifest's
  * [patch] section. Returns NULL when the dependency is not overridden. */
 /* `from_manifest` (may be NULL) is set to 1 when the override came from the
@@ -1969,24 +1986,10 @@ static const char* dep_override_for(TomlDocument* doc, const char* name, int* fr
     for (int i = 0; i < g_ovr_count; i++) {
         if (strcmp(g_ovr_name[i], name) == 0) return g_ovr_path[i];
     }
-    if (doc) {
-        /* [patch] keys are quoted in the file exactly as [dependencies] keys
-         * are, and the parser keeps the quotes -- so look up both spellings
-         * rather than silently never matching. */
-        static char unwrapped[1024];
-        const char* p = toml_get_value(doc, "patch", name);
-        if (!p || !*p) {
-            char quoted[520];
-            snprintf(quoted, sizeof(quoted), "\"%s\"", name);
-            p = toml_get_value(doc, "patch", quoted);
-        }
-        if (p && *p) {
-            const char* v = dep_unwrap_patch_value(p, unwrapped, sizeof(unwrapped), name);
-            if (v && from_manifest) *from_manifest = 1;
-            return v;
-        }
-    }
-    return NULL;
+    static char unwrapped[1024];
+    const char* v = dep_patch_in(doc, name, unwrapped, sizeof(unwrapped));
+    if (v && from_manifest) *from_manifest = 1;
+    return v;
 }
 
 /* Append every module root a package declares. `root` is the package's
@@ -2196,72 +2199,211 @@ static const char* manifest_spelling(const char* path, char* buf, size_t buf_siz
     return buf;
 }
 
-/* Resolve [dependencies] from the project manifest onto the module search
- * path. Safe to call when there is no manifest and no dependencies. */
-void ae_resolve_dependencies(void) {
-    if (!path_exists(ae_manifest_path())) return;
-    TomlDocument* doc = toml_parse_file(ae_manifest_path());
-    if (!doc) return;
+static int paths_same(const char* a, const char* b);
 
-    int count = 0;
-    TomlKeyValue* deps = toml_get_section_entries(doc, "dependencies", &count);
-    if (!deps || count <= 0) { toml_free_document(doc); return; }
+/* `base/rel` with each `seg/..` pair folded away, so a dependency's own
+ * [patch] path reads as the directory it names: `../pkga` patching
+ * `../pkgb` is `../pkgb`, not `../pkga/../pkgb`. Lexical only; whether the
+ * result exists is checked by the caller. */
+static void dep_join_relative(const char* base, const char* rel,
+                              char* out, size_t osz) {
+    char joined[4096];
+    snprintf(joined, sizeof(joined), "%s/%s", base, rel);
+    const char* seg[256];
+    size_t seg_len[256];
+    int n = 0;
+    int absolute = (joined[0] == '/');
+    const char* p = joined;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char* q = p;
+        while (*q && *q != '/') q++;
+        size_t len = (size_t)(q - p);
+        if (len == 1 && p[0] == '.') {
+            /* `.` contributes nothing */
+        } else if (len == 2 && p[0] == '.' && p[1] == '.' && n > 0 &&
+                   !(seg_len[n-1] == 2 && seg[n-1][0] == '.' && seg[n-1][1] == '.')) {
+            n--;
+        } else if (n < 256) {
+            seg[n] = p;
+            seg_len[n] = len;
+            n++;
+        }
+        p = q;
+    }
+    size_t o = 0;
+    if (absolute && o + 1 < osz) out[o++] = '/';
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && o + 1 < osz) out[o++] = '/';
+        for (size_t k = 0; k < seg_len[i] && o + 1 < osz; k++) out[o++] = seg[i][k];
+    }
+    if (o == 0 && o + 1 < osz) out[o++] = '.';
+    out[o] = '\0';
+}
+
+/* One package in the dependency graph (#2335): where it resolved and which
+ * manifest put it there, so a second, different resolution can name both. */
+#define AE_MAX_DEPS 128
+typedef struct {
+    char name[512];
+    char root[2048];
+    char required_by[512];
+} AeResolvedDep;
+
+/* Resolve [dependencies] from the project manifest onto the module search
+ * path, then each dependency's own [dependencies], transitively (#2335).
+ * Safe to call when there is no manifest and no dependencies.
+ *
+ * Precedence for where a package comes from, highest first:
+ *   1. --override on the command line;
+ *   2. the CONSUMER's [patch] (the project being built), wherever in the
+ *      graph the package is required -- the consumer owns the build;
+ *   3. the [patch] of the package that requires it, resolved against THAT
+ *      package's root, so a library can point at its own submodule without
+ *      every consumer spelling a path into someone else's checkout;
+ *   4. the package cache.
+ *
+ * The walk is breadth-first, so the consumer's direct dependencies claim
+ * their names first. A package reached twice at the same directory (a
+ * diamond, or a cycle) is resolved once. Reached at two DIFFERENT
+ * directories, it is an error naming both: picking either would silently
+ * build the other side against code it was never tested with.
+ *
+ * Returns the number of such conflicts; callers stop on non-zero. */
+int ae_resolve_dependencies(void) {
+    if (!path_exists(ae_manifest_path())) return 0;
+    TomlDocument* root_doc = toml_parse_file(ae_manifest_path());
+    if (!root_doc) return 0;
+
+    static AeResolvedDep deps[AE_MAX_DEPS];
+    int dep_count = 0;
+    int conflicts = 0;
 
     char pkgroot[1024];
     dep_packages_root(pkgroot, sizeof(pkgroot));
 
-    for (int i = 0; i < count; i++) {
-        /* Quoted keys keep their quotes through the parser, and a
-         * dependency name is a path with dots so it is ALWAYS quoted in
-         * practice. Strip them, or every lookup and every message carries
-         * literal quote characters. */
-        char name_buf[512];
-        {
-            const char* k = deps[i].key;
-            if (!k || !*k) continue;
-            size_t kl = strlen(k);
-            if (kl >= 2 && k[0] == '"' && k[kl-1] == '"') {
-                snprintf(name_buf, sizeof(name_buf), "%.*s", (int)(kl - 2), k + 1);
-            } else {
-                snprintf(name_buf, sizeof(name_buf), "%s", k);
-            }
+    /* Index -1 is the consumer's own manifest; 0.. are the resolved
+     * dependencies in the order they were first reached. */
+    for (int at = -1; at < dep_count; at++) {
+        TomlDocument* doc = root_doc;
+        const char* requirer = "the project";
+        if (at >= 0) {
+            char manifest[2100];
+            snprintf(manifest, sizeof(manifest), "%s/aether.toml", deps[at].root);
+            if (!path_exists(manifest)) continue;
+            doc = toml_parse_file(manifest);
+            if (!doc) continue;
+            requirer = deps[at].name;
         }
-        const char* name = name_buf;
-        if (!*name) continue;
 
-        int ovr_from_manifest = 0;
-        const char* ovr = dep_override_for(doc, name, &ovr_from_manifest);
-        char root[2048];
-        if (ovr) {
-            /* A [patch] path is stated relative to the manifest, which may be
-             * an ancestor's under the no-chdir commands (#2148). */
-            char rel[2048];
-            snprintf(root, sizeof(root), "%s",
-                     ovr_from_manifest ? manifest_relative(ovr, rel, sizeof(rel)) : ovr);
-            /* An overridden build MUST say so. The failure this prevents is a
-             * green local run against a working copy CI does not have --
-             * named explicitly in the reporting ask, and the reason Cargo
-             * prints its "Patching ..." line. */
-            fprintf(stderr, "Overriding %s -> %s\n", name, root);
-            if (!dir_exists(root)) {
-                fprintf(stderr,
-                    "Error: override path for '%s' does not exist: %s\n", name, root);
+        int count = 0;
+        TomlKeyValue* entries = toml_get_section_entries(doc, "dependencies", &count);
+        for (int i = 0; entries && i < count; i++) {
+            /* Quoted keys keep their quotes through the parser, and a
+             * dependency name is a path with dots so it is ALWAYS quoted in
+             * practice. Strip them, or every lookup and every message carries
+             * literal quote characters. */
+            char name_buf[512];
+            {
+                const char* k = entries[i].key;
+                if (!k || !*k) continue;
+                size_t kl = strlen(k);
+                if (kl >= 2 && k[0] == '"' && k[kl-1] == '"') {
+                    snprintf(name_buf, sizeof(name_buf), "%.*s", (int)(kl - 2), k + 1);
+                } else {
+                    snprintf(name_buf, sizeof(name_buf), "%s", k);
+                }
+            }
+            const char* name = name_buf;
+            if (!*name) continue;
+
+            int ovr_from_manifest = 0;
+            const char* ovr = dep_override_for(root_doc, name, &ovr_from_manifest);
+            int patched_by_requirer = 0;
+            char root[2048];
+            if (ovr) {
+                /* A [patch] path is stated relative to the manifest, which may be
+                 * an ancestor's under the no-chdir commands (#2148). */
+                char rel[2048];
+                snprintf(root, sizeof(root), "%s",
+                         ovr_from_manifest ? manifest_relative(ovr, rel, sizeof(rel)) : ovr);
+            } else if (at >= 0) {
+                char unwrapped[1024];
+                const char* own = dep_patch_in(doc, name, unwrapped, sizeof(unwrapped));
+                if (own && path_is_absolute_any(own)) {
+                    snprintf(root, sizeof(root), "%s", own);
+                } else if (own) {
+                    dep_join_relative(deps[at].root, own, root, sizeof(root));
+                } else {
+                    snprintf(root, sizeof(root), "%s/%s", pkgroot, name);
+                }
+                if (own) { ovr = own; patched_by_requirer = 1; }
+            } else {
+                snprintf(root, sizeof(root), "%s/%s", pkgroot, name);
+            }
+
+            int seen = -1;
+            for (int d = 0; d < dep_count; d++) {
+                if (strcmp(deps[d].name, name) == 0) { seen = d; break; }
+            }
+            if (seen >= 0) {
+                if (!paths_same(deps[seen].root, root)) {
+                    fprintf(stderr,
+                        "Error: dependency '%s' resolves to two different directories:\n"
+                        "         %s (required by %s)\n"
+                        "         %s (required by %s)\n"
+                        "       Add a [patch] entry for it to this project's aether.toml\n"
+                        "       to choose one.\n",
+                        name, deps[seen].root, deps[seen].required_by, root, requirer);
+                    conflicts++;
+                }
                 continue;
             }
-        } else {
-            snprintf(root, sizeof(root), "%s/%s", pkgroot, name);
-            if (!dir_exists(root)) {
+
+            if (ovr) {
+                /* An overridden build MUST say so. The failure this prevents is a
+                 * green local run against a working copy CI does not have --
+                 * named explicitly in the reporting ask, and the reason Cargo
+                 * prints its "Patching ..." line. */
+                if (patched_by_requirer)
+                    fprintf(stderr, "Overriding %s -> %s (patched by %s)\n", name, root, requirer);
+                else
+                    fprintf(stderr, "Overriding %s -> %s\n", name, root);
+                if (!dir_exists(root)) {
+                    fprintf(stderr,
+                        "Error: override path for '%s' does not exist: %s\n", name, root);
+                    continue;
+                }
+            } else if (!dir_exists(root)) {
                 /* Name the missing dependency and the fix, rather than
                  * letting it surface later as an unknown-module error. */
-                fprintf(stderr,
-                    "Error: dependency '%s' is not installed. Run:\n"
-                    "    ae add %s\n", name, name);
+                if (at >= 0)
+                    fprintf(stderr,
+                        "Error: dependency '%s' (required by %s) is not installed. Run:\n"
+                        "    ae add %s\n", name, requirer, name);
+                else
+                    fprintf(stderr,
+                        "Error: dependency '%s' is not installed. Run:\n"
+                        "    ae add %s\n", name, name);
                 continue;
             }
+
+            if (dep_count >= AE_MAX_DEPS) {
+                fprintf(stderr, "Error: more than %d dependencies in the graph; '%s' "
+                                "and any after it are not resolved\n", AE_MAX_DEPS, name);
+                continue;
+            }
+            AeResolvedDep* r = &deps[dep_count++];
+            snprintf(r->name, sizeof(r->name), "%s", name);
+            snprintf(r->root, sizeof(r->root), "%s", root);
+            snprintf(r->required_by, sizeof(r->required_by), "%s", requirer);
+            dep_append_module_roots(root, name);
         }
-        dep_append_module_roots(root, name);
+        if (doc != root_doc) toml_free_document(doc);
     }
-    toml_free_document(doc);
+    toml_free_document(root_doc);
+    return conflicts;
 }
 
 /* The project's `[build] defines`, appended to whatever -D the command line
@@ -4515,7 +4657,7 @@ static int cmd_run(int argc, char** argv) {
 
     /* #1901: [dependencies] join the module search path, after the caller's
      * own --lib flags so an explicit path still wins. */
-    ae_resolve_dependencies();
+    if (ae_resolve_dependencies() != 0) return 1;
     load_defines_from_toml();
 
     // Resolve directory argument (e.g. "." or "myproject/") to src/main.ae
@@ -6793,7 +6935,7 @@ static int cmd_build(int argc, char** argv) {
      * flag handling. `ae build sub/thing.ae` from a subdirectory chdirs to
      * the project root here; resolving before that would read no manifest
      * (or the wrong one) and silently produce an empty search path. */
-    ae_resolve_dependencies();
+    if (ae_resolve_dependencies() != 0) return 1;
     /* The project's `[build] defines`, for the same reason: read before the
      * walk-up they were found only from the project root, so the same
      * `ae build src/app.ae` compiled a different program from `src/`. */
@@ -9236,7 +9378,7 @@ static int cmd_lib_path(int argc, char** argv) {
      * worst for the shell-script fallback above, which would silently hand
      * `--lib` an empty chain. */
     find_and_chdir_to_aether_toml(NULL);
-    ae_resolve_dependencies();
+    if (ae_resolve_dependencies() != 0) return 1;
     if (tc.lib_dir_count == 0) {
         fputs("lib\n", stdout);
         return 0;

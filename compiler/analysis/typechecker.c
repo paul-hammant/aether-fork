@@ -1126,6 +1126,10 @@ static int is_numeric_scalar(TypeKind kind) {
            kind == TYPE_FLOAT || kind == TYPE_FLOAT32 || kind == TYPE_LONGDOUBLE;
 }
 
+static int is_value_cast_numeric(TypeKind kind) {
+    return is_numeric_scalar(kind) || kind == TYPE_BYTE;
+}
+
 static TypeKind wider_integer_kind(TypeKind a, TypeKind b) {
     if (a == TYPE_UINT64 || b == TYPE_UINT64) return TYPE_UINT64;
     if (a == TYPE_INT64 || b == TYPE_INT64) return TYPE_INT64;
@@ -8297,8 +8301,12 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
             Type* operand = expr->child_count > 0 ? infer_type(expr->children[0], table) : NULL;
             if (operand && expr->node_type) {
                 int same = (operand->kind == expr->node_type->kind);
-                int numeric = is_numeric_scalar(operand->kind) &&
-                              is_numeric_scalar(expr->node_type->kind);
+                /* `byte` is numeric for a value cast (#2337): `b as int`
+                 * widens, `n as byte` narrows as C's unsigned char does. It
+                 * stays out of is_numeric_scalar, whose other callers type
+                 * arithmetic, where byte already promotes on its own. */
+                int numeric = is_value_cast_numeric(operand->kind) &&
+                              is_value_cast_numeric(expr->node_type->kind);
                 /* #1132: a bitstruct never converts IMPLICITLY (is_type_compatible
                  * keeps it strictly nominal), but `as` is exactly how you cross the
                  * boundary on purpose: `w as Flags` to wrap a raw word, `f as

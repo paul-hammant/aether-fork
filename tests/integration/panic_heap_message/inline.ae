@@ -1,0 +1,5 @@
+main() {
+    index = 5
+    buflen = 4
+    panic("test: ${index} is outside a slice of ${buflen}")
+}

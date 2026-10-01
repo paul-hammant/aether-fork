@@ -549,6 +549,17 @@ Only a local path override is supported. A table naming anything else (a git URL
 
 Either way the build prints `Overriding <dep> -> <path>`. A `--override` for a dependency also overridden by `[patch]` wins, since the invocation is the more specific instruction. The override target is read exactly like an installed package: it needs its own `[package] modules` declaration.
 
+#### Transitive dependencies
+
+A dependency's own `[dependencies]` are resolved too, all the way down, so a project names only what it imports directly. Where each package comes from, highest first:
+
+1. `--override` on the command line;
+2. the consuming project's `[patch]`, wherever in the graph the package is required;
+3. the `[patch]` of the package that requires it, resolved against **that package's** root (so a library can point at its own submodule without every consumer spelling a path into its checkout);
+4. the package cache.
+
+A transitive patch is announced as `Overriding <dep> -> <path> (patched by <package>)`. A package reached twice at the same directory (a diamond, or a cycle) is resolved once. Reached at two **different** directories, it is an error naming both and who required each; add a `[patch]` for it to the consuming project to choose one.
+
 ### Namespace Convention
 
 Function names must be prefixed with the namespace:

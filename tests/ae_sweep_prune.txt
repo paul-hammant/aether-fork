@@ -165,6 +165,7 @@ tests/integration/optional_reject/
 tests/integration/or_block_reject/
 tests/integration/panic_actor_step_drain/
 tests/integration/panic_categories/
+tests/integration/panic_heap_message/
 tests/integration/panic_stack_trace/
 tests/integration/panic_unwind_no_leak/
 tests/integration/ptr_index_diagnostic/

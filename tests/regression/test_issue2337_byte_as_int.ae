@@ -1,0 +1,54 @@
+// Regression #2337: `byte as int` is a value cast like any numeric one.
+//
+// The bug: `plain = bytes[i] as int` was refused with E0200 "cannot cast
+// byte to int with `as`", while `return (bytes[i] as int) & 255` compiled.
+// Pre-fix this file failed to build at the first assignment-form cast,
+// because the value-cast check's numeric set left out byte (the return form
+// compiled only because return values are not run through that check).
+// It exercises byte as a numeric kind for `as` in every position: an
+// assignment, a return, inside an expression, narrowing to byte, and
+// widening to float.
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exit(code: int)
+
+returned(pixels: ptr, i: int) -> int {
+    bytes = pixels as byte[]
+    return (bytes[i] as int) & 255
+}
+
+assigned(pixels: ptr, i: int) -> int {
+    bytes = pixels as byte[]
+    plain = bytes[i] as int
+    return plain
+}
+
+check(label: string, got: int, want: int) {
+    if got != want {
+        println("FAIL ${label}: got ${got}, want ${want}")
+        exit(1)
+    }
+}
+
+main() {
+    block = calloc(16, 1)
+    px = block as byte[]
+    px[3] = 200 as byte
+    px[4] = 300 as byte // narrows as C's unsigned char: 300 - 256
+
+    check("return form", returned(block, 3), 200)
+    check("assignment form", assigned(block, 3), 200)
+    masked = (px[3] as int) & 255
+    check("inside an expression", masked, 200)
+    check("narrowing", px[4] as int, 44)
+
+    f = px[3] as float
+    if f != 200.0 {
+        println("FAIL byte as float: ${f}")
+        exit(1)
+    }
+
+    free(block)
+    println("PASS byte as int")
+}
