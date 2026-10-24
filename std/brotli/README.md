@@ -15,7 +15,7 @@ Decompression and compression supported via `libbrotli`.
 
 To defend against decompression bombs / zip bombs (such as the "broccoli2shell" attack vector / CVE-2026-111497) where a small compressed payload expands into huge allocations, use `decompress_max`:
 
-```aether
+```aether,fragment
 plain, n, err = brotli.decompress_max(string.bytes(compressed), 1048576) // cap at 1MB
 ```
 
@@ -23,7 +23,7 @@ If the decompressed output exceeds `max_bytes`, `decompress_max` immediately abo
 
 Streaming decompression is also available:
 
-```aether
+```aether,fragment
 ds, err = brotli.decompress_stream_new(max_bytes)
 chunk1, n1, err = brotli.decompress_stream_write(ds, data1)
 tail, tn, err = brotli.decompress_stream_finish(ds)

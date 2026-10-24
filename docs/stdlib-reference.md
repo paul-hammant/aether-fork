@@ -18,7 +18,7 @@ header comment is the authoritative description.
 | `std.audit` | Query the sandbox audit trail. | 4 | [guide](../std/audit/README.md) · [source](../std/audit/module.ae) |
 | `std.bignum` | Arbitrary-precision integers. | 29 | [guide](../std/bignum/README.md) · [source](../std/bignum/module.ae) |
 | `std.bits` | Unsigned bit operations: rotates, shifts, popcount, leading zeros, unsigned divide. | 17 | [guide](../std/bits/README.md) · [source](../std/bits/module.ae) |
-| `std.brotli` | Brotli compression, streaming and one-shot, for `Content-Encoding: br`. | 20 | [guide](../std/brotli/README.md) · [source](../std/brotli/module.ae) |
+| `std.brotli` | Brotli compression, streaming and one-shot, for `Content-Encoding: br`. | 33 | [guide](../std/brotli/README.md) · [source](../std/brotli/module.ae) |
 | `std.bytes` | Mutable byte buffer with random access and overlap-safe copies. | 32 | [guide](../std/bytes/README.md) · [source](../std/bytes/module.ae) |
 | `std.capsicum` | FreeBSD Capsicum capability-mode bindings. | 28 | [guide](../std/capsicum/README.md) · [source](../std/capsicum/module.ae) |
 | `std.cas` | Content-addressed store keyed by the sha256 of file contents. | 7 | [guide](../std/cas/README.md) · [source](../std/cas/module.ae) |
