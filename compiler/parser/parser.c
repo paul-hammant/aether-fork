@@ -206,6 +206,7 @@ static int token_is_value_ident(const Token* token) {
         case TOKEN_BYTE:
         case TOKEN_FUNC:
         case TOKEN_AFTER:
+        case TOKEN_MOVE:
             return 1;
         default:
             return 0;
@@ -3157,7 +3158,7 @@ static ASTNode* parse_unary_expression_inner(Parser* parser) {
     if (!operator) return NULL;
     
     if (operator->type == TOKEN_EXCLAIM || operator->type == TOKEN_MINUS ||
-        operator->type == TOKEN_TILDE ||
+        operator->type == TOKEN_TILDE || operator->type == TOKEN_MOVE ||
         operator->type == TOKEN_INCREMENT || operator->type == TOKEN_DECREMENT) {
         advance_token(parser);
         int errors_before = aether_error_count();
@@ -4750,7 +4751,12 @@ ASTNode* parse_exports_list(Parser* parser) {
             // RIGHT_PAREN" parse error.
             if (peek_token(parser) &&
                 peek_token(parser)->type == TOKEN_RIGHT_PAREN) break;
-            Token* name = expect_token(parser, TOKEN_IDENTIFIER);
+            Token* name = peek_token(parser);
+            if (name && (name->type == TOKEN_IDENTIFIER || token_is_value_ident(name) || name->type == TOKEN_MOVE)) {
+                advance_token(parser);
+            } else {
+                name = expect_token(parser, TOKEN_IDENTIFIER);
+            }
             if (!name) break;
             ASTNode* id = create_ast_node(AST_IDENTIFIER, name->value,
                                           name->line, name->column);
@@ -5118,7 +5124,12 @@ ASTNode* parse_message_definition(Parser* parser) {
             return NULL;
         }
         
-        Token* field_name = expect_token(parser, TOKEN_IDENTIFIER);
+        Token* field_name = peek_token(parser);
+        if (field_name && (field_name->type == TOKEN_IDENTIFIER || token_is_value_ident(field_name) || field_name->type == TOKEN_MOVE)) {
+            advance_token(parser);
+        } else {
+            field_name = expect_token(parser, TOKEN_IDENTIFIER);
+        }
         if (!field_name) break;
 
         if (!expect_token(parser, TOKEN_COLON)) break;
@@ -6287,7 +6298,12 @@ ASTNode* parse_function_definition(Parser* parser) {
     // Or traditional:
     //   name(param1, param2) { ... }
     
-    Token* name = expect_token(parser, TOKEN_IDENTIFIER);
+    Token* name = peek_token(parser);
+    if (name && (name->type == TOKEN_IDENTIFIER || token_is_value_ident(name))) {
+        advance_token(parser);
+    } else {
+        name = expect_token(parser, TOKEN_IDENTIFIER);
+    }
     if (!name) return NULL;
     
     expect_token(parser, TOKEN_LEFT_PAREN);
@@ -8205,6 +8221,17 @@ ASTNode* parse_top_level_decl(Parser* parser) {
             case TOKEN_MAIN:
                 node = parse_main_function(parser);
                 break;
+            case TOKEN_MOVE: {
+                Token* next = peek_ahead(parser, 1);
+                if (next && next->type == TOKEN_LEFT_PAREN) {
+                    node = parse_function_definition(parser);
+                    break;
+                } else {
+                    parser_error(parser, "Unexpected 'move' at top level");
+                    advance_token(parser);
+                    return NULL;
+                }
+            }
             case TOKEN_IDENTIFIER: {
                 // Check if this is a function: identifier(...)
                 Token* next = peek_ahead(parser, 1);
@@ -8296,7 +8323,7 @@ ASTNode* parse_top_level_decl(Parser* parser) {
                  * to a nonexistent C function. Detect this case here
                  * and emit a clear "reserved keyword" diagnostic that
                  * matches the inner-block handling (parser.c:71). */
-                if (token_is_reserved_keyword(token)) {
+                if (token_is_reserved_keyword(token) && token->type != TOKEN_MOVE) {
                     Token* nxt = peek_ahead(parser, 1);
                     if (nxt && nxt->type == TOKEN_LEFT_PAREN) {
                         char msg[256];

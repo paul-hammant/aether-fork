@@ -209,7 +209,7 @@ void own_emit_part(CodeGenerator* gen, Type* pt, const char* lv, OwnOp op) {
     case TYPE_PTR:   /* a string sequence: its cells are counted */
         if (op == OWN_RETAIN) fprintf(o, "    %s = string_seq_retain(%s);\n", lv, lv);
         else if (op == OWN_DROP) fprintf(o, "    string_seq_free(%s); %s = (StringSeq*)0;\n", lv, lv);
-        else if (op == OWN_ZERO) fprintf(o, "    %s = (StringSeq*)0;\n", lv);
+        else if (op == OWN_ZERO) fprintf(o, "    %s = (StringSeq*)0;\n", lv, lv);
         return;
     case TYPE_STRUCT: {
         const char* s = struct_owning_strings(gen, pt);

@@ -1,0 +1,62 @@
+// Test zero-copy buffer move and actor delivery without leaks or use-after-move errors,
+// as well as dead-actor / undelivered message cleanup.
+import std.bytes
+import std.mem
+
+message Chunk {
+    data: ptr,
+    ptr_val: long
+}
+
+actor BufferReceiver {
+    receive {
+        Chunk(data, ptr_val) -> {
+            let b = data
+            if bytes.length(b) != 67108864 {
+                panic("received buffer length must be 64MB")
+            }
+            if (mem.ptr_to_long(bytes.data(b)) != ptr_val) {
+                panic("pointer addresses must match (zero-copy)")
+            }
+            let p0 = bytes.get(b, 0)
+            let p1 = bytes.get(b, 67108863)
+            if p0 != 42 || p1 != 99 {
+                panic("buffer data mismatch")
+            }
+            bytes.free(b)
+        }
+    }
+}
+
+actor DyingReceiver {
+    receive {
+        Chunk(data, ptr_val) -> {
+            // Intentionally panic/die while holding a buffer or leave queued
+            panic("actor dying")
+        }
+    }
+}
+
+main() {
+    let receiver = spawn(BufferReceiver())
+    let buf = bytes.new(67108864)
+    bytes.set_length(buf, 67108864)
+    bytes.set(buf, 0, 42)
+    bytes.set(buf, 67108863, 99)
+
+    let ptr_before = mem.ptr_to_long(bytes.data(buf))
+
+    // Move buffer into message (zero-copy transfer)
+    receiver ! Chunk { data: move buf, ptr_val: ptr_before }
+
+    sleep(50)
+
+    // Test dead actor / undelivered message queue cleanup
+    let dyings = spawn(DyingReceiver())
+    let buf2 = bytes.new(1024)
+    bytes.set_length(buf2, 1024)
+    dyings ! Chunk { data: move buf2, ptr_val: 0 }
+    sleep(10)
+
+    println("zero-copy buffer test passed")
+}

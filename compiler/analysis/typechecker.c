@@ -5020,6 +5020,7 @@ Type* infer_unary_type(ASTNode* operand, AeTokenType operator) {
         case TOKEN_MINUS:
         case TOKEN_INCREMENT:
         case TOKEN_DECREMENT:
+        case TOKEN_MOVE:
             return clone_type(operand_type); // Same type as operand
 
         case TOKEN_AMPERSAND: {
@@ -8181,28 +8182,223 @@ static void scoped_check_bindings(ASTNode* node, ASTNode* root) {
  * would repeat across iterations is caught, while one rebound each iteration
  * is not. It descends into nested scopes' own analysis, not the parent's. */
 #define ISO_SET_MAX 128
-typedef struct { const char* names[ISO_SET_MAX]; int count; } IsoSet;
+
+static ASTNode* iso_closure_body_block(ASTNode* closure) {
+    if (!closure) return NULL;
+    for (int i = closure->child_count - 1; i >= 0; i--) {
+        if (closure->children[i] && closure->children[i]->type == AST_BLOCK) {
+            return closure->children[i];
+        }
+    }
+    return NULL;
+}
+
+static int iso_is_closure_param(ASTNode* closure, const char* name) {
+    for (int i = 0; i < closure->child_count; i++) {
+        ASTNode* child = closure->children[i];
+        if (child && child->type == AST_CLOSURE_PARAM && child->value &&
+            strcmp(child->value, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void iso_collect_ident_append(const char* name, char*** names, int* count, int* cap) {
+    for (int i = 0; i < *count; i++) {
+        if (strcmp((*names)[i], name) == 0) return;
+    }
+    if (*count >= *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *names = aether_xrealloc(*names, *cap * sizeof(char*));
+    }
+    (*names)[(*count)++] = strdup(name);
+}
+
+static int iso_subtree_reads(ASTNode* node, const char* name) {
+    if (!node || !name) return 0;
+    if (node->type == AST_CLOSURE) return 0;
+    if (node->type == AST_IDENTIFIER && node->value &&
+        strcmp(node->value, name) == 0) {
+        return 1;
+    }
+    for (int i = 0; i < node->child_count; i++) {
+        if (iso_subtree_reads(node->children[i], name)) return 1;
+    }
+    return 0;
+}
+
+#define ISO_FL_NONE 0
+#define ISO_FL_FRESH 1
+#define ISO_FL_CAPTURE 2
+
+static int iso_first_occurrence_kind(ASTNode* node, const char* name) {
+    if (!node) return ISO_FL_NONE;
+    if (node->type == AST_CLOSURE &&
+        !(node->value && strcmp(node->value, "trailing") == 0)) {
+        return ISO_FL_NONE;
+    }
+    if ((node->type == AST_VARIABLE_DECLARATION || node->type == AST_CONST_DECLARATION) &&
+        node->value && strcmp(node->value, name) == 0) {
+        for (int c = 0; c < node->child_count; c++) {
+            if (iso_subtree_reads(node->children[c], name)) return ISO_FL_CAPTURE;
+        }
+        return ISO_FL_FRESH;
+    }
+    if (node->type == AST_IDENTIFIER && node->value && strcmp(node->value, name) == 0) {
+        return ISO_FL_CAPTURE;
+    }
+    for (int i = 0; i < node->child_count; i++) {
+        int r = iso_first_occurrence_kind(node->children[i], name);
+        if (r != ISO_FL_NONE) return r;
+    }
+    return ISO_FL_NONE;
+}
+
+static int iso_is_local_var(ASTNode* block, const char* name) {
+    if (!block || !name) return 0;
+    return iso_first_occurrence_kind(block, name) == ISO_FL_FRESH;
+}
+
+static void iso_collect_identifiers(ASTNode* node, char*** names, int* count, int* cap) {
+    if (!node) return;
+    if (node->type == AST_IDENTIFIER && node->value) {
+        iso_collect_ident_append(node->value, names, count, cap);
+    }
+    if (node->type == AST_COMPOUND_ASSIGNMENT && node->value) {
+        iso_collect_ident_append(node->value, names, count, cap);
+    }
+    for (int i = 0; i < node->child_count; i++) {
+        ASTNode* child = node->children[i];
+        if (child && child->type == AST_CLOSURE) {
+            char** inner = NULL;
+            int inner_n = 0, inner_cap = 0;
+            for (int j = 0; j < child->child_count; j++) {
+                iso_collect_identifiers(child->children[j], &inner, &inner_n, &inner_cap);
+            }
+            ASTNode* inner_body = iso_closure_body_block(child);
+            for (int k = 0; k < inner_n; k++) {
+                if (!iso_is_closure_param(child, inner[k]) &&
+                    !(inner_body && iso_is_local_var(inner_body, inner[k]))) {
+                    iso_collect_ident_append(inner[k], names, count, cap);
+                }
+                free(inner[k]);
+            }
+            free(inner);
+        } else {
+            iso_collect_identifiers(child, names, count, cap);
+        }
+    }
+}
+
+typedef struct {
+    const char* name;
+    int line;
+} IsoItem;
+
+typedef struct {
+    IsoItem items[ISO_SET_MAX];
+    int count;
+} IsoSet;
+
+typedef struct {
+    const char* names[ISO_SET_MAX];
+    int count;
+} NameSet;
+
+typedef struct {
+    ASTNode* fn;
+    NameSet rebound;
+    int in_closure;
+    ASTNode* closure;
+} IsoContext;
 
 static int iso_has(const IsoSet* s, const char* n) {
+    if (!n) return 0;
+    for (int i = 0; i < s->count; i++)
+        if (s->items[i].name && strcmp(s->items[i].name, n) == 0) return 1;
+    return 0;
+}
+
+static int iso_get_line(const IsoSet* s, const char* n) {
+    if (!n) return 0;
+    for (int i = 0; i < s->count; i++)
+        if (s->items[i].name && strcmp(s->items[i].name, n) == 0) return s->items[i].line;
+    return 0;
+}
+
+static void iso_put_line(IsoSet* s, const char* n, int line) {
+    if (!n) return;
+    for (int i = 0; i < s->count; i++) {
+        if (s->items[i].name && strcmp(s->items[i].name, n) == 0) {
+            s->items[i].line = line;
+            return;
+        }
+    }
+    if (s->count < ISO_SET_MAX) {
+        s->items[s->count].name = n;
+        s->items[s->count].line = line;
+        s->count++;
+    }
+}
+
+static void iso_del(IsoSet* s, const char* n) {
+    if (!n) return;
+    for (int i = 0; i < s->count; i++) {
+        if (s->items[i].name && strcmp(s->items[i].name, n) == 0) {
+            s->items[i] = s->items[--s->count];
+            return;
+        }
+    }
+}
+
+static void iso_merge(IsoSet* dst, const IsoSet* src) {
+    for (int i = 0; i < src->count; i++) {
+        iso_put_line(dst, src->items[i].name, src->items[i].line);
+    }
+}
+
+static int name_has(const NameSet* s, const char* n) {
     if (!n) return 0;
     for (int i = 0; i < s->count; i++)
         if (s->names[i] && strcmp(s->names[i], n) == 0) return 1;
     return 0;
 }
-static void iso_put(IsoSet* s, const char* n) {
-    if (!n || iso_has(s, n)) return;
+
+static void name_put(NameSet* s, const char* n) {
+    if (!n || name_has(s, n)) return;
     if (s->count < ISO_SET_MAX) s->names[s->count++] = n;
 }
-static void iso_del(IsoSet* s, const char* n) {
-    if (!n) return;
-    for (int i = 0; i < s->count; i++)
-        if (s->names[i] && strcmp(s->names[i], n) == 0) {
-            s->names[i] = s->names[--s->count];
-            return;
+
+static int is_param_owned_or_kept(ASTNode* fn, const char* name) {
+    if (!fn || !name) return 0;
+    for (int i = 0; i < fn->child_count; i++) {
+        ASTNode* p = fn->children[i];
+        if (!p) continue;
+        if (p->type == AST_BLOCK) break;
+        if ((p->type == AST_PATTERN_VARIABLE || p->type == AST_VARIABLE_DECLARATION) &&
+            p->value && strcmp(p->value, name) == 0) {
+            if (p->node_type && p->node_type->kind == TYPE_ISOLATED) return 1;
+            if (p->annotation && (annotation_has_marker(p->annotation, "keep_param") ||
+                                  annotation_has_marker(p->annotation, "into_param"))) return 1;
+            if (fn->node_type && fn->node_type->kind == TYPE_FUNCTION &&
+                fn_type_param_mode(fn->node_type, i) != FN_MODE_BORROWED) return 1;
+            return 0;
         }
+    }
+    return 1;
 }
-static void iso_merge(IsoSet* dst, const IsoSet* src) {
-    for (int i = 0; i < src->count; i++) iso_put(dst, src->names[i]);
+
+static int is_fn_parameter(ASTNode* fn, const char* name) {
+    if (!fn || !name) return 0;
+    for (int i = 0; i < fn->child_count; i++) {
+        ASTNode* p = fn->children[i];
+        if (!p) continue;
+        if (p->type == AST_BLOCK) break;
+        if ((p->type == AST_PATTERN_VARIABLE || p->type == AST_VARIABLE_DECLARATION) &&
+            p->value && strcmp(p->value, name) == 0) return 1;
+    }
+    return 0;
 }
 
 /* Is this declaration an Isolated binding (annotated type, or init = isolate())? */
@@ -8239,40 +8435,124 @@ static int iso_diverges(ASTNode* n) {
     return n && !stmt_can_complete(g_typecheck_program, n);
 }
 
-static void iso_check(ASTNode* node, IsoSet* moved, IsoSet* iso) {
+static void iso_check(ASTNode* node, IsoSet* moved, IsoSet* iso, IsoContext* ctx) {
     if (!node) return;
     switch (node->type) {
         /* Nested scopes get their own analysis; don't leak this frame in. */
         case AST_FUNCTION_DEFINITION:
         case AST_BUILDER_FUNCTION:
         case AST_ACTOR_DEFINITION:
-        case AST_CLOSURE:
         case AST_QUOTE:
             return;
+
+        case AST_CLOSURE: {
+            char** idents = NULL;
+            int count = 0, cap = 0;
+            iso_collect_identifiers(node, &idents, &count, &cap);
+            ASTNode* cl_body = iso_closure_body_block(node);
+            for (int i = 0; i < count; i++) {
+                const char* nm = idents[i];
+                if (!iso_is_closure_param(node, nm) && !(cl_body && iso_is_local_var(cl_body, nm))) {
+                    if (iso_has(moved, nm)) {
+                        int prev_line = iso_get_line(moved, nm);
+                        char msg[320];
+                        snprintf(msg, sizeof(msg),
+                            "use of moved value '%s': line %d moved it, and it cannot be used again",
+                            nm, prev_line);
+                        type_error(msg, node->line, node->column);
+                    }
+                }
+                free(idents[i]);
+            }
+            free(idents);
+
+            IsoContext cl_ctx;
+            cl_ctx.fn = node;
+            cl_ctx.rebound.count = 0;
+            cl_ctx.in_closure = 1;
+            cl_ctx.closure = node;
+            IsoSet cl_moved; cl_moved.count = 0;
+            IsoSet cl_iso; cl_iso.count = 0;
+            if (cl_body) iso_check(cl_body, &cl_moved, &cl_iso, &cl_ctx);
+            return;
+        }
+
+        case AST_UNARY_EXPRESSION: {
+            if (node->value && strcmp(node->value, "move") == 0) {
+                if (node->child_count < 1 || !node->children[0]) return;
+                ASTNode* operand = node->children[0];
+                if (operand->type == AST_MEMBER_ACCESS) {
+                    const char* field_name = operand->value ? operand->value : "field";
+                    const char* obj_name = (operand->child_count > 0 && operand->children[0] && operand->children[0]->type == AST_IDENTIFIER && operand->children[0]->value) ? operand->children[0]->value : "object";
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "cannot move field '%s' out of object '%s'", field_name, obj_name);
+                    type_error(msg, node->line, node->column);
+                    return;
+                }
+                if (operand->type == AST_ARRAY_ACCESS) {
+                    type_error("cannot move element out of array", node->line, node->column);
+                    return;
+                }
+                if (operand->type != AST_IDENTIFIER || !operand->value) {
+                    type_error("operand of 'move' must be a variable name", node->line, node->column);
+                    return;
+                }
+                const char* nm = operand->value;
+                if (iso_has(moved, nm)) {
+                    int prev_line = iso_get_line(moved, nm);
+                    char msg[320];
+                    snprintf(msg, sizeof(msg),
+                        "use of moved value '%s': line %d moved it, and it cannot be used again",
+                        nm, prev_line);
+                    type_error(msg, node->line, node->column);
+                    return;
+                }
+                if (ctx->in_closure && ctx->closure) {
+                    ASTNode* cl_body = iso_closure_body_block(ctx->closure);
+                    if (!iso_is_closure_param(ctx->closure, nm) && !(cl_body && iso_is_local_var(cl_body, nm))) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg), "cannot move captured variable '%s' inside closure", nm);
+                        type_error(msg, node->line, node->column);
+                        return;
+                    }
+                }
+                if (ctx->fn && is_fn_parameter(ctx->fn, nm) && !name_has(&ctx->rebound, nm) && !is_param_owned_or_kept(ctx->fn, nm)) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "cannot move borrowed parameter '%s': parameter must be annotated with @keep or @into to transfer ownership", nm);
+                    type_error(msg, node->line, node->column);
+                    return;
+                }
+                iso_put_line(moved, nm, node->line);
+                return;
+            }
+            for (int i = 0; i < node->child_count; i++)
+                iso_check(node->children[i], moved, iso, ctx);
+            return;
+        }
 
         case AST_IDENTIFIER: {
             const char* nm = node->value;
             if (!nm) return;
             if (iso_has(moved, nm)) {
+                int prev_line = iso_get_line(moved, nm);
                 char msg[320];
                 snprintf(msg, sizeof(msg),
-                    "use of moved value '%s': an Isolated[T] value is consumed "
-                    "by its single use (isolate / consume / send) and cannot be "
-                    "used again. Re-create it with isolate(...) to send another.",
-                    nm);
+                    "use of moved value '%s': line %d moved it, and it cannot be used again",
+                    nm, prev_line);
                 type_error(msg, node->line, node->column);
                 return;
             }
-            if (iso_has(iso, nm)) iso_put(moved, nm); /* this reference consumes it */
+            if (iso_has(iso, nm)) iso_put_line(moved, nm, node->line);
             return;
         }
 
         case AST_VARIABLE_DECLARATION: {
             for (int i = 0; i < node->child_count; i++)
-                iso_check(node->children[i], moved, iso);   /* init (RHS) first */
+                iso_check(node->children[i], moved, iso, ctx);   /* init (RHS) first */
             if (node->value) {
                 iso_del(moved, node->value);                 /* fresh binding revives */
-                if (iso_decl_is_isolated(node)) iso_put(iso, node->value);
+                name_put(&ctx->rebound, node->value);
+                if (iso_decl_is_isolated(node)) iso_put_line(iso, node->value, node->line);
                 else iso_del(iso, node->value);
             }
             return;
@@ -8280,21 +8560,40 @@ static void iso_check(ASTNode* node, IsoSet* moved, IsoSet* iso) {
 
         case AST_ASSIGNMENT: {
             ASTNode* lhs = node->child_count > 0 ? node->children[0] : NULL;
-            if (node->child_count > 1) iso_check(node->children[1], moved, iso); /* RHS */
+            if (node->child_count > 1) iso_check(node->children[1], moved, iso, ctx); /* RHS */
             if (lhs && lhs->type == AST_IDENTIFIER && lhs->value) {
                 iso_del(moved, lhs->value);   /* plain rebind revives the name */
+                name_put(&ctx->rebound, lhs->value);
             } else {
-                iso_check(lhs, moved, iso);   /* member/index lhs: base is a read */
+                iso_check(lhs, moved, iso, ctx);   /* member/index lhs: base is a read */
+            }
+            return;
+        }
+
+        case AST_BLOCK: {
+            ASTNode* defers[32];
+            int defer_count = 0;
+            for (int i = 0; i < node->child_count; i++) {
+                ASTNode* child = node->children[i];
+                if (child && child->type == AST_DEFER_STATEMENT) {
+                    if (defer_count < 32) defers[defer_count++] = child;
+                }
+                iso_check(child, moved, iso, ctx);
+            }
+            for (int d = 0; d < defer_count; d++) {
+                if (defers[d]->child_count > 0) {
+                    iso_check(defers[d]->children[0], moved, iso, ctx);
+                }
             }
             return;
         }
 
         case AST_IF_STATEMENT: {
-            if (node->child_count > 0) iso_check(node->children[0], moved, iso); /* cond */
+            if (node->child_count > 0) iso_check(node->children[0], moved, iso, ctx); /* cond */
             IsoSet then_s = *moved;
-            if (node->child_count > 1) iso_check(node->children[1], &then_s, iso);
+            if (node->child_count > 1) iso_check(node->children[1], &then_s, iso, ctx);
             IsoSet else_s = *moved;
-            if (node->child_count > 2) iso_check(node->children[2], &else_s, iso);
+            if (node->child_count > 2) iso_check(node->children[2], &else_s, iso, ctx);
             int then_div = node->child_count > 1 && iso_diverges(node->children[1]);
             int else_div = node->child_count > 2 && iso_diverges(node->children[2]);
             if (then_div && else_div) return;   /* code after is unreachable */
@@ -8305,14 +8604,50 @@ static void iso_check(ASTNode* node, IsoSet* moved, IsoSet* iso) {
             return;
         }
 
+        case AST_MATCH_STATEMENT: {
+            if (node->child_count > 0) iso_check(node->children[0], moved, iso, ctx);
+            IsoSet joined; joined.count = 0;
+            int any_non_div = 0;
+            for (int i = 1; i < node->child_count; i++) {
+                ASTNode* arm = node->children[i];
+                if (!arm) continue;
+                IsoSet arm_s = *moved;
+                iso_check(arm, &arm_s, iso, ctx);
+                if (!iso_diverges(arm)) {
+                    iso_merge(&joined, &arm_s);
+                    any_non_div = 1;
+                }
+            }
+            if (any_non_div) *moved = joined;
+            return;
+        }
+
+        case AST_SWITCH_STATEMENT: {
+            if (node->child_count > 0) iso_check(node->children[0], moved, iso, ctx);
+            IsoSet joined; joined.count = 0;
+            int any_non_div = 0;
+            for (int i = 1; i < node->child_count; i++) {
+                ASTNode* c_case = node->children[i];
+                if (!c_case) continue;
+                IsoSet case_s = *moved;
+                iso_check(c_case, &case_s, iso, ctx);
+                if (!iso_diverges(c_case)) {
+                    iso_merge(&joined, &case_s);
+                    any_non_div = 1;
+                }
+            }
+            if (any_non_div) *moved = joined;
+            return;
+        }
+
         case AST_WHILE_LOOP:
         case AST_FOR_LOOP: {
             int body_idx = node->child_count - 1;
             for (int i = 0; i < body_idx; i++)          /* init/cond/incr once */
-                iso_check(node->children[i], moved, iso);
+                iso_check(node->children[i], moved, iso, ctx);
             if (body_idx >= 0) {                          /* body twice */
-                iso_check(node->children[body_idx], moved, iso);
-                iso_check(node->children[body_idx], moved, iso);
+                iso_check(node->children[body_idx], moved, iso, ctx);
+                iso_check(node->children[body_idx], moved, iso, ctx);
             }
             return;
         }
@@ -8322,17 +8657,39 @@ static void iso_check(ASTNode* node, IsoSet* moved, IsoSet* iso) {
              * local so a later use of x is a use-after-move. */
             if (node->type == AST_FUNCTION_CALL && node->value &&
                 strcmp(node->value, "isolate") == 0 && node->child_count == 1) {
-                iso_check(node->children[0], moved, iso);
+                iso_check(node->children[0], moved, iso, ctx);
                 ASTNode* a = node->children[0];
                 if (a && a->type == AST_IDENTIFIER && a->value &&
                     iso_type_is_moveworthy(a->node_type))
-                    iso_put(moved, a->value);
+                    iso_put_line(moved, a->value, node->line);
                 return;
             }
             for (int i = 0; i < node->child_count; i++)
-                iso_check(node->children[i], moved, iso);
+                iso_check(node->children[i], moved, iso, ctx);
             return;
     }
+}
+
+static void iso_check_function(ASTNode* fn, ASTNode* body) {
+    if (!body) return;
+    IsoSet moved; moved.count = 0;
+    IsoSet iso;   iso.count = 0;
+    IsoContext ctx;
+    ctx.fn = fn;
+    ctx.rebound.count = 0;
+    ctx.in_closure = 0;
+    ctx.closure = NULL;
+
+    if (fn) {
+        for (int i = 0; i < fn->child_count; i++) {
+            ASTNode* p = fn->children[i];
+            if (!p || p == body) { if (p == body) break; else continue; }
+            if ((p->type == AST_VARIABLE_DECLARATION || p->type == AST_PATTERN_VARIABLE) &&
+                p->value && p->node_type && p->node_type->kind == TYPE_ISOLATED)
+                iso_put_line(&iso, p->value, p->line);
+        }
+    }
+    iso_check(body, &moved, &iso, &ctx);
 }
 
 /* Entry point: register Isolated-typed parameters, then walk the body. */
@@ -10560,21 +10917,6 @@ static void check_param_modes(ASTNode* program, ASTNode* decl) {
     }
 }
 
-static void iso_check_function(ASTNode* fn, ASTNode* body) {
-    if (!body) return;
-    IsoSet moved; moved.count = 0;
-    IsoSet iso;   iso.count = 0;
-    if (fn) {
-        for (int i = 0; i < fn->child_count; i++) {
-            ASTNode* p = fn->children[i];
-            if (!p || p == body) { if (p == body) break; else continue; }
-            if ((p->type == AST_VARIABLE_DECLARATION || p->type == AST_PATTERN_VARIABLE) &&
-                p->value && p->node_type && p->node_type->kind == TYPE_ISOLATED)
-                iso_put(&iso, p->value);
-        }
-    }
-    iso_check(body, &moved, &iso);
-}
 
 /* #481 effect tags — capability of a call's NAMESPACE (the as-written prefix,
  * e.g. `file.read` → fs). std.fs re-exports the file/dir/path namespaces,
