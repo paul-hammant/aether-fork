@@ -7,6 +7,7 @@
 
 #ifdef AETHER_HAS_BROTLI
 #include <brotli/encode.h>
+#include <brotli/decode.h>
 #endif
 
 /* The input bytes and their count. `data` is always raw: the std module
@@ -201,6 +202,239 @@ int brotli_try_compress(const char* data, int length, int quality) {
     return 1;
 }
 
+/* One-shot decompression output slot, thread-local */
+static _Thread_local unsigned char* tls_decomp_buf = NULL;
+static _Thread_local size_t         tls_decomp_cap = 0;
+static _Thread_local int            tls_decomp_len = 0;
+
+static void free_decomp_tls(void) {
+    if (tls_decomp_buf) {
+        aether_caps_free(tls_decomp_buf, tls_decomp_cap);
+        tls_decomp_buf = NULL;
+    }
+    tls_decomp_cap = 0;
+    tls_decomp_len = 0;
+}
+
+int brotli_try_decompress(const char* data, int length, int max_bytes) {
+    free_decomp_tls();
+    if (length < 0 || max_bytes < 0) return 0;
+
+    size_t in_len;
+    const unsigned char* in = brotli_unwrap_bytes(data, length, &in_len);
+    if (in_len > 0 && !in) return 0;
+
+    BrotliDecoderState* dec = BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (!dec) return 0;
+
+    size_t limit = (max_bytes > 0) ? (size_t)max_bytes : ((size_t)1 << 30);
+    size_t initial_cap = (in_len > 0 && in_len * 4 > 256) ? (in_len * 4) : 256;
+    if (initial_cap > limit) initial_cap = limit;
+    if (initial_cap == 0) initial_cap = 1;
+
+    size_t cap = initial_cap;
+    unsigned char* out = (unsigned char*)aether_caps_malloc(cap);
+    if (!out) {
+        BrotliDecoderDestroyInstance(dec);
+        return 0;
+    }
+
+    size_t avail_in = in_len;
+    const uint8_t* next_in = (const uint8_t*)in;
+    size_t total_out = 0;
+    int status = 0;
+
+    for (;;) {
+        size_t avail_out = cap - total_out;
+        uint8_t* next_out = (uint8_t*)(out + total_out);
+
+        BrotliDecoderResult res = BrotliDecoderDecompressStream(
+            dec, &avail_in, &next_in, &avail_out, &next_out, NULL);
+
+        total_out = cap - avail_out;
+
+        if (res == BROTLI_DECODER_RESULT_SUCCESS) {
+            status = 1;
+            break;
+        } else if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            if (total_out >= limit) {
+                status = -2;
+                break;
+            }
+            size_t ncap = cap * 2;
+            if (ncap > limit) ncap = limit;
+            if (ncap <= cap) {
+                status = -2;
+                break;
+            }
+            unsigned char* nb = (unsigned char*)aether_caps_malloc(ncap);
+            if (!nb) {
+                status = 0;
+                break;
+            }
+            memcpy(nb, out, total_out);
+            aether_caps_free(out, cap);
+            out = nb;
+            cap = ncap;
+        } else if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
+            status = 0;
+            break;
+        } else {
+            status = 0;
+            break;
+        }
+    }
+
+    BrotliDecoderDestroyInstance(dec);
+
+    if (status == 1) {
+        tls_decomp_buf = out;
+        tls_decomp_cap = cap;
+        tls_decomp_len = (int)total_out;
+        return 1;
+    } else {
+        aether_caps_free(out, cap);
+        return status;
+    }
+}
+
+const char* brotli_get_decompress_bytes(void) {
+    return (const char*)(tls_decomp_buf ? tls_decomp_buf : (unsigned char*)"");
+}
+
+int brotli_get_decompress_length(void) {
+    return tls_decomp_len;
+}
+
+void brotli_release_decompress(void) {
+    free_decomp_tls();
+}
+
+typedef struct {
+    BrotliDecoderState* dec;
+    unsigned char* out;
+    size_t out_cap;
+    int    out_len;
+    size_t total_out;
+    size_t limit;
+    int    finished;
+    int    broken;
+    int    limit_exceeded;
+} BrotliDecompressStream;
+
+void* brotli_try_decompress_stream_new(int max_bytes) {
+    if (max_bytes < 0) return NULL;
+    BrotliDecompressStream* z = (BrotliDecompressStream*)aether_caps_calloc(1, sizeof(BrotliDecompressStream));
+    if (!z) return NULL;
+    z->dec = BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (!z->dec) {
+        aether_caps_free(z, sizeof(BrotliDecompressStream));
+        return NULL;
+    }
+    z->limit = (max_bytes > 0) ? (size_t)max_bytes : ((size_t)1 << 30);
+    return z;
+}
+
+int brotli_try_decompress_stream_write(void* handle, const char* data, int length) {
+    BrotliDecompressStream* z = (BrotliDecompressStream*)handle;
+    if (!z || z->finished || z->broken || length < 0) return 0;
+
+    size_t in_len;
+    const unsigned char* in = brotli_unwrap_bytes(data, length, &in_len);
+    if (in_len > 0 && !in) return 0;
+
+    z->out_len = 0;
+    size_t used = 0;
+
+    if (z->out_cap < 256) {
+        size_t cap = 256;
+        unsigned char* nb = (unsigned char*)aether_caps_malloc(cap);
+        if (!nb) { z->broken = 1; return 0; }
+        if (z->out) aether_caps_free(z->out, z->out_cap);
+        z->out = nb;
+        z->out_cap = cap;
+    }
+
+    size_t avail_in = in_len;
+    const uint8_t* next_in = (const uint8_t*)in;
+
+    for (;;) {
+        size_t avail_out = z->out_cap - used;
+        uint8_t* next_out = (uint8_t*)(z->out + used);
+
+        BrotliDecoderResult res = BrotliDecoderDecompressStream(
+            z->dec, &avail_in, &next_in, &avail_out, &next_out, NULL);
+
+        used = z->out_cap - avail_out;
+
+        if (z->total_out + used > z->limit) {
+            z->broken = 1;
+            z->limit_exceeded = 1;
+            return -2;
+        }
+
+        if (res == BROTLI_DECODER_RESULT_SUCCESS) {
+            z->finished = 1;
+            break;
+        } else if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
+            if (avail_in == 0) break;
+        } else if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            size_t remaining_limit = z->limit - z->total_out;
+            if (used >= remaining_limit) {
+                z->broken = 1;
+                z->limit_exceeded = 1;
+                return -2;
+            }
+            size_t ncap = z->out_cap * 2;
+            if (ncap > remaining_limit) ncap = remaining_limit;
+            if (ncap <= z->out_cap) {
+                z->broken = 1;
+                z->limit_exceeded = 1;
+                return -2;
+            }
+            unsigned char* nb = (unsigned char*)aether_caps_malloc(ncap);
+            if (!nb) { z->broken = 1; return 0; }
+            memcpy(nb, z->out, used);
+            aether_caps_free(z->out, z->out_cap);
+            z->out = nb;
+            z->out_cap = ncap;
+        } else {
+            z->broken = 1;
+            return 0;
+        }
+    }
+
+    z->total_out += used;
+    z->out_len = (int)used;
+    return 1;
+}
+
+int brotli_try_decompress_stream_finish(void* handle) {
+    BrotliDecompressStream* z = (BrotliDecompressStream*)handle;
+    if (!z || z->broken) return 0;
+    if (z->finished) { z->out_len = 0; return 1; }
+    return brotli_try_decompress_stream_write(handle, NULL, 0);
+}
+
+const char* brotli_get_decompress_stream_bytes(void* handle) {
+    BrotliDecompressStream* z = (BrotliDecompressStream*)handle;
+    if (!z || !z->out) return "";
+    return (const char*)z->out;
+}
+
+int brotli_get_decompress_stream_length(void* handle) {
+    BrotliDecompressStream* z = (BrotliDecompressStream*)handle;
+    return z ? z->out_len : 0;
+}
+
+void brotli_release_decompress_stream(void* handle) {
+    BrotliDecompressStream* z = (BrotliDecompressStream*)handle;
+    if (!z) return;
+    if (z->dec) BrotliDecoderDestroyInstance(z->dec);
+    if (z->out) aether_caps_free(z->out, z->out_cap);
+    aether_caps_free(z, sizeof(BrotliDecompressStream));
+}
+
 #else /* !AETHER_HAS_BROTLI */
 
 /* stream_new returning NULL is the one signal a caller cannot ignore: every
@@ -223,6 +457,30 @@ void brotli_release_stream(void* handle) { (void)handle; }
 int brotli_try_compress(const char* data, int length, int quality) {
     (void)data; (void)length; (void)quality; return 0;
 }
+
+int brotli_try_decompress(const char* data, int length, int max_bytes) {
+    (void)data; (void)length; (void)max_bytes; return 0;
+}
+
+const char* brotli_get_decompress_bytes(void) { return ""; }
+int brotli_get_decompress_length(void) { return 0; }
+void brotli_release_decompress(void) {}
+
+void* brotli_try_decompress_stream_new(int max_bytes) {
+    (void)max_bytes; return NULL;
+}
+
+int brotli_try_decompress_stream_write(void* handle, const char* data, int length) {
+    (void)handle; (void)data; (void)length; return 0;
+}
+
+int brotli_try_decompress_stream_finish(void* handle) {
+    (void)handle; return 0;
+}
+
+const char* brotli_get_decompress_stream_bytes(void* handle) { (void)handle; return ""; }
+int brotli_get_decompress_stream_length(void* handle) { (void)handle; return 0; }
+void brotli_release_decompress_stream(void* handle) { (void)handle; }
 
 #endif /* AETHER_HAS_BROTLI */
 

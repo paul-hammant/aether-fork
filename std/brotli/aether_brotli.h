@@ -58,6 +58,26 @@ const char* brotli_get_compress_bytes(void);
 int         brotli_get_compress_length(void);
 void        brotli_release_compress(void);
 
+/* One-shot decompression. `max_bytes` sets a strict upper bound on decompressed
+ * output size (0 = default safety ceiling). Returns 1 on success, 0 on decode
+ * error / corrupted bitstream, and -2 when `max_bytes` output limit is
+ * exceeded (mitigating decompression bombs / DoS attack vectors like
+ * broccoli2shell / CVE-2026-111497). */
+int         brotli_try_decompress(const char* data, int length, int max_bytes);
+const char* brotli_get_decompress_bytes(void);
+int         brotli_get_decompress_length(void);
+void        brotli_release_decompress(void);
+
+/* Streaming decompression. `max_bytes` sets a strict upper bound on cumulative
+ * decompressed output across all stream writes (0 = default safety ceiling). */
+void*       brotli_try_decompress_stream_new(int max_bytes);
+int         brotli_try_decompress_stream_write(void* handle, const char* data, int length);
+int         brotli_try_decompress_stream_finish(void* handle);
+
+const char* brotli_get_decompress_stream_bytes(void* handle);
+int         brotli_get_decompress_stream_length(void* handle);
+void        brotli_release_decompress_stream(void* handle);
+
 /* Why a system library rather than a vendored implementation:
  * libbrotlienc ships in every mainstream distro (apt libbrotli-dev, brew
  * brotli) and exposes exactly the streaming encoder this needs

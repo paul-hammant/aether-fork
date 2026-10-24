@@ -21,7 +21,7 @@ cat > cc-probe <<'EOF'
 for arg do
     printf '%s\n' "$arg" >> "$LINK_ARGS"
     case "$arg" in
-        -lssl|-lcrypto|-lz|-lnghttp2|-lpcre2-8|-lbrotlienc|-lbrotlicommon|-lzstd|-lfyaml)
+        -lssl|-lcrypto|-lz|-lnghttp2|-lpcre2-8|-lbrotlienc|-lbrotlidec|-lbrotlicommon|-lzstd|-lfyaml)
             case " $ALLOWED_LIBS " in
                 *" $arg "*) ;;
                 *) echo "unexpected optional dependency: $arg" >&2; exit 1 ;;
@@ -43,7 +43,7 @@ check_args() {
     # Windows uses the native compiler; inspect its verbose command instead.
     if [ "$WINDOWS" = 1 ]; then tr ' ' '\n' < "$1" > "$LINK_ARGS"; fi
     [ -s "$LINK_ARGS" ] || fail 'C compiler command missing'
-    for lib in -lssl -lcrypto -lz -lnghttp2 -lpcre2-8 -lbrotlienc -lbrotlicommon -lzstd -lfyaml; do
+    for lib in -lssl -lcrypto -lz -lnghttp2 -lpcre2-8 -lbrotlienc -lbrotlidec -lbrotlicommon -lzstd -lfyaml; do
         if grep -Fxq -- "$lib" "$LINK_ARGS"; then
             case " $ALLOWED_LIBS " in
                 *" $lib "*) ;;
@@ -81,7 +81,7 @@ esac
 for entry in \
     'regex|-lpcre2-8' \
     'zlib|-lz' \
-    'brotli|-lbrotlienc -lbrotlicommon' \
+    'brotli|-lbrotlienc -lbrotlidec -lbrotlicommon' \
     'zstd|-lzstd' \
     'yaml|-lfyaml' \
     'cryptography|-lssl -lcrypto' \
@@ -150,7 +150,7 @@ main() {
     else { println("excluded") }
 }
 EOF
-ALLOWED_LIBS='-lbrotlienc -lbrotlicommon'
+ALLOWED_LIBS='-lbrotlienc -lbrotlidec -lbrotlicommon'
 export ALLOWED_LIBS
 : > "$LINK_ARGS"
 "$AE" build conditional.ae -D WITH_CODEC -o conditional-on --verbose > conditional-on.log 2>&1 \

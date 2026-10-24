@@ -3019,7 +3019,7 @@ static unsigned optional_link_requirement(const char* tok, size_t len) {
         { "-lssl", LINK_OPENSSL }, { "-lcrypto", LINK_OPENSSL },
         { "-lz", LINK_ZLIB }, { "-lnghttp2", LINK_NGHTTP2 },
         { "-lpcre2-8", LINK_PCRE2 },
-        { "-lbrotlienc", LINK_BROTLI }, { "-lbrotlicommon", LINK_BROTLI },
+        { "-lbrotlienc", LINK_BROTLI }, { "-lbrotlidec", LINK_BROTLI }, { "-lbrotlicommon", LINK_BROTLI },
         { "-lzstd", LINK_ZSTD }, { "-lfyaml", LINK_YAML },
     };
     for (size_t i = 0; i < sizeof(libs) / sizeof(libs[0]); i++) {

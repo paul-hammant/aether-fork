@@ -6673,7 +6673,7 @@ static const AetherLinkReq g_link_reqs[] = {
     /* Base64 entry points share aether_cryptography.o with OpenSSL users. */
     { "std.encoding",         "-lssl -lcrypto" },
     { "std.zlib",             "-lz" },
-    { "std.brotli",           "-lbrotlienc -lbrotlicommon" },
+    { "std.brotli",           "-lbrotlienc -lbrotlidec -lbrotlicommon" },
     { "std.zstd",             "-lzstd" },
     { "std.yaml",             "-lfyaml" },
     /* These veneers reference the HTTP server/client objects from C, not
