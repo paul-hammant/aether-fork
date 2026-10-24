@@ -9300,8 +9300,15 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                     const char* var_name = safe_value_name(operand->value);
                     const char* ctype = order_c11_type(operand);
                     if (!ctype) ctype = "void*";
-                    fprintf(gen->output, "({ %s _move_tmp = %s; %s = 0; _move_tmp; })",
-                            ctype, var_name, var_name);
+                    TempSeq s;
+                    seq_open(gen, &s);
+                    const char* tmp = seq_let(gen, &s, ctype, "_move_tmp");
+                    fprintf(gen->output, "%s", var_name);
+                    seq_next(gen, &s);
+                    fprintf(gen->output, "%s = 0", var_name);
+                    seq_next(gen, &s);
+                    fprintf(gen->output, "%s", tmp);
+                    seq_close(gen, &s);
                 } else {
                     generate_expression(gen, operand);
                 }
