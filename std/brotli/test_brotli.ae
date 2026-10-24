@@ -1,4 +1,8 @@
-// std.brotli unit tests — co-located with std/brotli/ module.
+// std.brotli unit & security regression tests — co-located with std/brotli/ module.
+//
+// Includes test vector patterns and edge cases adapted from Google Brotli
+// (https://github.com/google/brotli), subject to the MIT License:
+// Copyright 2016 The Brotli Authors. All rights reserved.
 
 import std.spec
 import std.brotli
@@ -103,6 +107,32 @@ main() {
                 _out, _olen, derr = brotli.decompress(string.bytes(""))
                 spec.assert_err(derr, "empty input buffer is rejected")
             }
+
+            spec.it("rejects trailing garbage appended to valid stream") callback {
+                // Adapted from Google Brotli decompress_test.py (test_garbage_appended)
+                n = string.length(SAMPLE)
+                packed, plen, err = brotli.compress(string.bytes(SAMPLE)[0..n], brotli.FAST_QUALITY)
+                spec.assert_ok(err, "compress succeeds")
+
+                buf = bytes.new(plen + 5)
+                bytes.copy_from_string(buf, 0, packed, plen)
+                bytes.copy_from_string(buf, plen, "extra", 5)
+                corrupt = bytes.finish(buf, plen + 5)
+
+                _out, _olen, derr = brotli.decompress(string.bytes(corrupt)[0..plen + 5])
+                spec.assert_err(derr, "trailing garbage appended to stream is rejected")
+            }
+
+            spec.it("rejects truncated bitstream") callback {
+                n = string.length(SAMPLE)
+                packed, plen, err = brotli.compress(string.bytes(SAMPLE)[0..n], brotli.FAST_QUALITY)
+                spec.assert_ok(err, "compress succeeds")
+
+                // Truncate stream midway
+                trunc_len = plen / 2
+                _out, _olen, derr = brotli.decompress(string.bytes(packed)[0..trunc_len])
+                spec.assert_err(derr, "truncated bitstream is rejected")
+            }
         }
 
         spec.describe(fw, "std.brotli streaming decompression") {
@@ -158,6 +188,10 @@ main() {
 
                 _d1, _dn1, de1 = brotli.decompress_stream_write(ds, string.bytes(packed)[0..plen])
                 spec.assert_err_contains(de1, "output limit exceeded", "streaming decompress halts bomb exceeding limit")
+
+                // Subsequent write on broken handle fails safely
+                _d2, _dn2, de2 = brotli.decompress_stream_write(ds, string.bytes("more")[0..4])
+                spec.assert_err(de2, "broken stream handle rejects further writes")
 
                 brotli.decompress_stream_free(ds)
             }

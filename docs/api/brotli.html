@@ -24,13 +24,26 @@
     <li><a href="#get_compress_bytes">get_compress_bytes</a></li>
     <li><a href="#get_compress_length">get_compress_length</a></li>
     <li><a href="#release_compress">release_compress</a></li>
+    <li><a href="#get_decompress_bytes">get_decompress_bytes</a></li>
+    <li><a href="#get_decompress_length">get_decompress_length</a></li>
+    <li><a href="#release_decompress">release_decompress</a></li>
+    <li><a href="#try_decompress_stream_new">try_decompress_stream_new</a></li>
+    <li><a href="#get_decompress_stream_bytes">get_decompress_stream_bytes</a></li>
+    <li><a href="#get_decompress_stream_length">get_decompress_stream_length</a></li>
+    <li><a href="#release_decompress_stream">release_decompress_stream</a></li>
     <li><a href="#available">available</a></li>
     <li><a href="#compress">compress</a></li>
+    <li><a href="#decompress">decompress</a></li>
+    <li><a href="#decompress_max">decompress_max</a></li>
     <li><a href="#stream_new">stream_new</a></li>
     <li><a href="#stream_write">stream_write</a></li>
     <li><a href="#stream_flush">stream_flush</a></li>
     <li><a href="#stream_finish">stream_finish</a></li>
     <li><a href="#stream_free">stream_free</a></li>
+    <li><a href="#decompress_stream_new">decompress_stream_new</a></li>
+    <li><a href="#decompress_stream_write">decompress_stream_write</a></li>
+    <li><a href="#decompress_stream_finish">decompress_stream_finish</a></li>
+    <li><a href="#decompress_stream_free">decompress_stream_free</a></li>
     <li><a href="#MIN_QUALITY">MIN_QUALITY</a></li>
     <li><a href="#MAX_QUALITY">MAX_QUALITY</a></li>
     <li><a href="#DEFAULT_QUALITY">DEFAULT_QUALITY</a></li>
@@ -178,6 +191,38 @@
       <h3 class="function-name">release_compress <span class="kind">extern</span></h3>
       <pre class="usage"><code>release_compress()</code></pre>
     </div>
+    <div class="function" id="get_decompress_bytes" data-name="get_decompress_bytes">
+      <h3 class="function-name">get_decompress_bytes <span class="kind">extern</span></h3>
+      <pre class="usage"><code>get_decompress_bytes() <span class="arrow">-&gt;</span> ptr</code></pre>
+    </div>
+    <div class="function" id="get_decompress_length" data-name="get_decompress_length">
+      <h3 class="function-name">get_decompress_length <span class="kind">extern</span></h3>
+      <pre class="usage"><code>get_decompress_length() <span class="arrow">-&gt;</span> int</code></pre>
+    </div>
+    <div class="function" id="release_decompress" data-name="release_decompress">
+      <h3 class="function-name">release_decompress <span class="kind">extern</span></h3>
+      <pre class="usage"><code>release_decompress()</code></pre>
+    </div>
+    <div class="function" id="try_decompress_stream_new" data-name="try_decompress_stream_new">
+      <h3 class="function-name">try_decompress_stream_new <span class="kind">extern</span></h3>
+      <pre class="usage"><code>try_decompress_stream_new(max_bytes) <span class="arrow">-&gt;</span> ptr</code></pre>
+      <p class="signature"><span class="sig-params">max_bytes: int</span></p>
+    </div>
+    <div class="function" id="get_decompress_stream_bytes" data-name="get_decompress_stream_bytes">
+      <h3 class="function-name">get_decompress_stream_bytes <span class="kind">extern</span></h3>
+      <pre class="usage"><code>get_decompress_stream_bytes(handle) <span class="arrow">-&gt;</span> ptr</code></pre>
+      <p class="signature"><span class="sig-params">handle: ptr</span></p>
+    </div>
+    <div class="function" id="get_decompress_stream_length" data-name="get_decompress_stream_length">
+      <h3 class="function-name">get_decompress_stream_length <span class="kind">extern</span></h3>
+      <pre class="usage"><code>get_decompress_stream_length(handle) <span class="arrow">-&gt;</span> int</code></pre>
+      <p class="signature"><span class="sig-params">handle: ptr</span></p>
+    </div>
+    <div class="function" id="release_decompress_stream" data-name="release_decompress_stream">
+      <h3 class="function-name">release_decompress_stream <span class="kind">extern</span></h3>
+      <pre class="usage"><code>release_decompress_stream(handle)</code></pre>
+      <p class="signature"><span class="sig-params">handle: ptr</span></p>
+    </div>
     <div class="function" id="available" data-name="available">
       <h3 class="function-name">available <span class="kind">fn</span></h3>
       <pre class="usage"><code>available() <span class="arrow">-&gt;</span> int</code></pre>
@@ -188,6 +233,18 @@
       <pre class="usage"><code>compress(data, quality)</code></pre>
       <p class="signature"><span class="sig-params">data: byte[], quality: int</span></p>
       <p class="doc">One-shot: compress a body already in memory. Returns (bytes, count, &quot;&quot;) on success, (&quot;&quot;, 0, error) otherwise. Quality out of range is clamped.</p>
+    </div>
+    <div class="function" id="decompress" data-name="decompress">
+      <h3 class="function-name">decompress <span class="kind">fn</span></h3>
+      <pre class="usage"><code>decompress(data)</code></pre>
+      <p class="signature"><span class="sig-params">data: byte[]</span></p>
+      <p class="doc">One-shot: decompress brotli-encoded data. Returns (bytes, count, &quot;&quot;) on success, (&quot;&quot;, 0, error) otherwise.</p>
+    </div>
+    <div class="function" id="decompress_max" data-name="decompress_max">
+      <h3 class="function-name">decompress_max <span class="kind">fn</span></h3>
+      <pre class="usage"><code>decompress_max(data, max_bytes)</code></pre>
+      <p class="signature"><span class="sig-params">data: byte[], max_bytes: int</span></p>
+      <p class="doc">One-shot decompress with a strict output limit (`max_bytes`). If output would exceed `max_bytes`, decoding is aborted and returns an error mitigating decompression bomb attack vectors (e.g. broccoli2shell / CVE-2026-111497).</p>
     </div>
     <div class="function" id="stream_new" data-name="stream_new">
       <h3 class="function-name">stream_new <span class="kind">fn</span></h3>
@@ -218,6 +275,30 @@
       <pre class="usage"><code>stream_free(handle)</code></pre>
       <p class="signature"><span class="sig-params">handle: ptr</span></p>
       <p class="doc">Release the handle. Safe on null.</p>
+    </div>
+    <div class="function" id="decompress_stream_new" data-name="decompress_stream_new">
+      <h3 class="function-name">decompress_stream_new <span class="kind">fn</span></h3>
+      <pre class="usage"><code>decompress_stream_new(max_bytes) <span class="arrow">-&gt;</span> (ptr, string)</code></pre>
+      <p class="signature"><span class="sig-params">max_bytes: int</span></p>
+      <p class="doc">Streaming decompression. `max_bytes` sets a strict cumulative output upper bound across stream lifetime (0 = default safety ceiling).</p>
+    </div>
+    <div class="function" id="decompress_stream_write" data-name="decompress_stream_write">
+      <h3 class="function-name">decompress_stream_write <span class="kind">fn</span></h3>
+      <pre class="usage"><code>decompress_stream_write(handle, data)</code></pre>
+      <p class="signature"><span class="sig-params">handle: ptr, data: byte[]</span></p>
+      <p class="doc">Feed bytes into a decompression stream. Returns (decompressed_chunk, count, &quot;&quot;).</p>
+    </div>
+    <div class="function" id="decompress_stream_finish" data-name="decompress_stream_finish">
+      <h3 class="function-name">decompress_stream_finish <span class="kind">fn</span></h3>
+      <pre class="usage"><code>decompress_stream_finish(handle) <span class="arrow">-&gt;</span> (string, int, string)</code></pre>
+      <p class="signature"><span class="sig-params">handle: ptr</span></p>
+      <p class="doc">Finish a decompression stream and flush any final decompressed bytes.</p>
+    </div>
+    <div class="function" id="decompress_stream_free" data-name="decompress_stream_free">
+      <h3 class="function-name">decompress_stream_free <span class="kind">fn</span></h3>
+      <pre class="usage"><code>decompress_stream_free(handle)</code></pre>
+      <p class="signature"><span class="sig-params">handle: ptr</span></p>
+      <p class="doc">Release a decompression stream handle. Safe on null.</p>
     </div>
     <div class="function" id="MIN_QUALITY" data-name="MIN_QUALITY">
       <h3 class="function-name">MIN_QUALITY <span class="kind">const</span></h3>

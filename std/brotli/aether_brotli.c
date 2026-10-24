@@ -254,7 +254,11 @@ int brotli_try_decompress(const char* data, int length, int max_bytes) {
         total_out = cap - avail_out;
 
         if (res == BROTLI_DECODER_RESULT_SUCCESS) {
-            status = 1;
+            if (avail_in > 0) {
+                status = 0; /* Trailing garbage after valid stream */
+            } else {
+                status = 1;
+            }
             break;
         } else if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
             if (total_out >= limit) {

@@ -1,0 +1,1 @@
+- `std.brotli`: Added one-shot (`decompress`, `decompress_max`) and streaming (`decompress_stream_new`, `decompress_stream_write`, `decompress_stream_finish`, `decompress_stream_free`) Brotli decoder APIs, with output size limit enforcement to defend against decompression bomb / zip bomb attack vectors.
