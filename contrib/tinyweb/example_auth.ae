@@ -55,16 +55,23 @@ main() {
         }
     }
 
-    println("Starting server on localhost:8080...")
-    println("")
-    println("Test the auth flow:")
-    println("  curl http://localhost:8080/api/profile")
-    println("    -> 403 Try logging in again")
-    println("")
-    println("  curl -H 'Cookie: session=valid-session-abc' http://localhost:8080/api/profile")
-    println("    -> 200 User is logged in: alice@example.com")
+    http.monitor(tinyweb.http_server(server)) {
+        listening() |host: string, port: int| {
+            println("Test the auth flow:")
+            println("  curl http://localhost:${port}/api/profile")
+            println("    -> 403 Try logging in again")
+            println("")
+            println("  curl -H 'Cookie: session=valid-session-abc' http://localhost:${port}/api/profile")
+            println("    -> 200 User is logged in: alice@example.com")
+            println("\nPress Ctrl+C to stop.")
+        }
+    }
 
+    println("Starting server on localhost:8080...")
     result = tinyweb.tw_start(server)
-    if result != "" { println("ERROR: Failed to start server: ${result}") }
+    if result != "" {
+        println("ERROR: Failed to start server: ${result}")
+    }
+
     tinyweb.tw_stop(server)
 }

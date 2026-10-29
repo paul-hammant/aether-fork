@@ -75,19 +75,23 @@ main() {
         }
     }
 
+    http.monitor(tinyweb.http_server(server)) {
+        listening() |host: string, port: int| {
+            println("Server running! Try:")
+            println("  curl http://localhost:${port}/api/v1/health")
+            println("  curl http://localhost:${port}/api/v1/greeting/Jane/Doe")
+            println("  curl -H 'X-Admin-Token: secret42' http://localhost:${port}/admin/dashboard")
+            println("  curl http://localhost:${port}/admin/dashboard    # -> 403")
+            println("  curl http://localhost:${port}/shop/catalog/products/99")
+            println("  curl http://localhost:${port}/extra/ping")
+            println("\nPress Ctrl+C to stop.")
+        }
+    }
+
     println("Starting server on localhost:8080...")
     result = tinyweb.tw_start(server)
-
-    if result == "" {
-        println("Server running! Try:")
-        println("  curl http://localhost:8080/api/v1/health")
-        println("  curl http://localhost:8080/api/v1/greeting/Jane/Doe")
-        println("  curl -H 'X-Admin-Token: secret42' http://localhost:8080/admin/dashboard")
-        println("  curl http://localhost:8080/admin/dashboard    # -> 403")
-        println("  curl http://localhost:8080/shop/catalog/products/99")
-        println("  curl http://localhost:8080/extra/ping")
-    } else {
-        println("ERROR: Failed to start server")
+    if result != "" {
+        println("ERROR: Failed to start server: ${result}")
     }
 
     tinyweb.tw_stop(server)

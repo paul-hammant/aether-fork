@@ -1,6 +1,7 @@
 // Server-Sent Events (SSE) and chunked Example — streaming to browser clients
 
 import contrib.tinyweb
+import std.http
 
 main() {
     println("=== TinyWeb SSE + Chunked Example ===\n")
@@ -58,10 +59,19 @@ main() {
         }
     }
 
-    println("Open http://localhost:8080/ or: curl -N http://localhost:8080/sse/events")
-    println("Chunked: curl -N http://localhost:8080/countdown")
+    http.monitor(tinyweb.http_server(server)) {
+        listening() |host: string, port: int| {
+            println("Open http://localhost:${port}/ or: curl -N http://localhost:${port}/sse/events")
+            println("Chunked: curl -N http://localhost:${port}/countdown")
+            println("\nPress Ctrl+C to stop.")
+        }
+    }
 
+    println("Starting server on localhost:8080...")
     result = tinyweb.tw_start(server)
-    if result != "" { println("ERROR: Failed to start server: ${result}") }
+    if result != "" {
+        println("ERROR: Failed to start server: ${result}")
+    }
+
     tinyweb.tw_stop(server)
 }
