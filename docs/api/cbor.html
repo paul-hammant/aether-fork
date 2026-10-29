@@ -23,8 +23,12 @@
     <li><a href="#CBOR_TAG">CBOR_TAG</a></li>
     <li><a href="#CBOR_SIMPLE">CBOR_SIMPLE</a></li>
     <li><a href="#CBOR_FLOAT">CBOR_FLOAT</a></li>
+    <li><a href="#CborDecodeOptions">CborDecodeOptions</a></li>
+    <li><a href="#default_decode_options">default_decode_options</a></li>
     <li><a href="#parse">parse</a></li>
+    <li><a href="#parse_with">parse_with</a></li>
     <li><a href="#encode">encode</a></li>
+    <li><a href="#encode_deterministic">encode_deterministic</a></li>
     <li><a href="#type">type</a></li>
     <li><a href="#is_null">is_null</a></li>
     <li><a href="#is_undefined">is_undefined</a></li>
@@ -194,17 +198,37 @@
       <h3 class="function-name">CBOR_FLOAT <span class="kind">const</span></h3>
       <pre class="usage"><code>CBOR_FLOAT = 7</code></pre>
     </div>
+    <div class="function" id="CborDecodeOptions" data-name="CborDecodeOptions">
+      <h3 class="function-name">CborDecodeOptions <span class="kind">struct</span></h3>
+      <pre class="usage"><code>struct CborDecodeOptions</code></pre>
+    </div>
+    <div class="function" id="default_decode_options" data-name="default_decode_options">
+      <h3 class="function-name">default_decode_options <span class="kind">fn</span></h3>
+      <pre class="usage"><code>default_decode_options() <span class="arrow">-&gt;</span> CborDecodeOptions</code></pre>
+    </div>
     <div class="function" id="parse" data-name="parse">
       <h3 class="function-name">parse <span class="kind">fn</span></h3>
       <pre class="usage"><code>parse(cbor_data) <span class="arrow">-&gt;</span> ptr!</code></pre>
       <p class="signature"><span class="sig-params">cbor_data: string</span></p>
-      <p class="doc">Parse one CBOR data item that is the whole of `cbor_data`. Returns (value_ptr, &quot;&quot;) on success, (null, error) on failure. Caller owns the returned value and must free with cbor.free. Bytes left after the item are an error (#2470): `0102` used to parse as 1.</p>
+      <p class="doc">Parse one CBOR data item using safe default options.</p>
+    </div>
+    <div class="function" id="parse_with" data-name="parse_with">
+      <h3 class="function-name">parse_with <span class="kind">fn</span></h3>
+      <pre class="usage"><code>parse_with(cbor_data, opts) <span class="arrow">-&gt;</span> ptr!</code></pre>
+      <p class="signature"><span class="sig-params">cbor_data: string, opts: CborDecodeOptions</span></p>
+      <p class="doc">Parse one CBOR data item that is the whole of `cbor_data` with options.</p>
     </div>
     <div class="function" id="encode" data-name="encode">
       <h3 class="function-name">encode <span class="kind">fn</span></h3>
       <pre class="usage"><code>encode(value) <span class="arrow">-&gt;</span> string!</code></pre>
       <p class="signature"><span class="sig-params">value: ptr</span></p>
       <p class="doc">Serialize a CBOR value tree to a binary string. Returns (encoded_bytes, &quot;&quot;) on success, (&quot;&quot;, error) on failure.</p>
+    </div>
+    <div class="function" id="encode_deterministic" data-name="encode_deterministic">
+      <h3 class="function-name">encode_deterministic <span class="kind">fn</span></h3>
+      <pre class="usage"><code>encode_deterministic(value) <span class="arrow">-&gt;</span> string!</code></pre>
+      <p class="signature"><span class="sig-params">value: ptr</span></p>
+      <p class="doc">Deterministic CBOR encoding (RFC 8949 §4.2 Core Deterministic Encoding).</p>
     </div>
     <div class="function" id="type" data-name="type">
       <h3 class="function-name">type <span class="kind">fn</span></h3>

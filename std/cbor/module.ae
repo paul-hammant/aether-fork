@@ -13,7 +13,7 @@ import std.encoding
 
 exports(
     CBOR_INT, CBOR_BYTES, CBOR_TEXT, CBOR_ARRAY, CBOR_MAP, CBOR_TAG, CBOR_SIMPLE, CBOR_FLOAT,
-    parse, encode, type, is_null, is_undefined,
+    CborDecodeOptions, default_decode_options, parse, parse_with, encode, encode_deterministic, type, is_null, is_undefined,
     get_bool, get_int, get_long, get_float, get_string, get_bytes, get_tag_val, get_tag_child,
     object_get, map_get, object_size, array_size, object_entry,
     obj, arr, str, bytes, num, from_int, boolean, null_value, undefined_value, tag,
@@ -30,10 +30,26 @@ const CBOR_TAG = 5
 const CBOR_SIMPLE = 6
 const CBOR_FLOAT = 7
 
-// Deepest nesting parse accepts, the same bound as std.json. The decoder
-// recurses once per level, so without a bound a few hundred kilobytes of
-// one-element arrays overflow the stack.
+// Deepest nesting parse accepts by default, the same bound as std.json.
 const CBOR_MAX_DEPTH = 256
+
+struct CborDecodeOptions {
+    max_depth: int
+    max_array_elements: int
+    max_map_pairs: int
+    allow_duplicate_keys: int
+    allow_indefinite: int
+}
+
+default_decode_options() -> CborDecodeOptions {
+    CborDecodeOptions opts
+    opts.max_depth = 256
+    opts.max_array_elements = 131072
+    opts.max_map_pairs = 131072
+    opts.allow_duplicate_keys = 0
+    opts.allow_indefinite = 1
+    return opts
+}
 
 // Memory model: a CborValue tree owns its text/byte-string payloads as an
 // AetherBytes buffer (str_bytes + str_len), not a `string` field. The choice
@@ -73,6 +89,13 @@ struct CborValue {
     ind: int // argument size of the head as parsed, see above
     indefinite: int // 1 for an indefinite-length item
     big: int // an integer outside the signed long range, see above
+}
+
+struct MapPair {
+    key: ptr
+    val: ptr
+    enc_k: string
+    enc_v: string
 }
 
 // ---- str payload helpers (see Memory model above) ----
@@ -142,6 +165,11 @@ struct Reader {
     buf: ptr // owned std.bytes copy of the input
     len: int
     offset: int
+    max_depth: int
+    max_array_elements: int
+    max_map_pairs: int
+    allow_duplicate_keys: int
+    allow_indefinite: int
 }
 
 // Read the byte at `off` (0..255). Bounds are checked by callers.
@@ -372,6 +400,36 @@ fn rd_byte(b: ptr, off: int) -> int {
     return bytes.get(b, off) & 255
 }
 
+fn map_has_duplicate_key(cv: *CborValue, key_cv: ptr) -> bool {
+    n = list.size(cv.map_keys)
+    i = 0
+    while i < n {
+        k = list.get_raw(cv.map_keys, i)
+        if equal_val(k, key_cv) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn duplicate_key_error(key_cv: ptr) -> string {
+    if key_cv == null { return "cbor: duplicate map key null" }
+    k = key_cv as *CborValue
+    if k.type == CBOR_TEXT {
+        s = str_payload_string(k)
+        esc = escape_string(s)
+        string.release(s)
+        msg = string.concat("cbor: duplicate map key ", esc)
+        string.release(esc)
+        return msg
+    }
+    k_diag = to_diagnose_string(key_cv)
+    msg = string.concat("cbor: duplicate map key ", k_diag)
+    string.release(k_diag)
+    return msg
+}
+
 // An indefinite-length string (RFC 8949 §3.2.3): definite-length strings of
 // the same major type up to a break. A chunk of another type, or a nested
 // indefinite-length string (`5f5f4101ffff`), is not well-formed; it used to
@@ -379,6 +437,9 @@ fn rd_byte(b: ptr, off: int) -> int {
 // diagnoses as it came.
 fn parse_indefinite_string(r: ptr, mt: int, depth: int) -> (ptr, string) {
     reader = r as *Reader
+    if reader.allow_indefinite == 0 {
+        return null, "cbor: indefinite-length items are disabled"
+    }
     cv = heap.new(CborValue)
     cv.type = CBOR_BYTES
     if mt == 3 {
@@ -457,8 +518,8 @@ fn parse_float(reader: *Reader, width: int) -> (ptr, string) {
 // an error, as is invalid UTF-8 in a text string (§3.1).
 parse_item(r: ptr, depth: int) -> (ptr, string) {
     reader = r as *Reader
-    if depth > CBOR_MAX_DEPTH {
-        return null, "cbor: nesting deeper than 256"
+    if depth > reader.max_depth {
+        return null, string.concat("cbor: nesting deeper than ", string.from_int(reader.max_depth))
     }
     if reader.offset >= reader.len {
         return null, "cbor: unexpected EOF"
@@ -505,9 +566,8 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
         len_val, err = read_value(r, ai)
         if err != "" { return null, err }
         string.release(err)
-        // Compared in long against what is left: narrowing a length of 2^31
-        // or more to int first made it negative and passed it as empty.
-        if len_val < 0 || len_val > ((reader.len - reader.offset) as long) { return null, "cbor: unexpected EOF" }
+        rem = (reader.len - reader.offset) as long
+        if len_val < 0 || len_val > rem { return null, "cbor: unexpected EOF" }
         if mt == 3 && !valid_utf8(reader.buf, reader.offset, len_val as int) {
             return null, "cbor: invalid UTF-8 in text string"
         }
@@ -527,7 +587,12 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
         cv.type = CBOR_ARRAY
         cv.list_val = list.new()
         if ai == 31 {
+            if reader.allow_indefinite == 0 {
+                free_value(cv)
+                return null, "cbor: indefinite-length items are disabled"
+            }
             cv.indefinite = 1
+            arr_count = 0
             while true {
                 if reader.offset >= reader.len {
                     free_value(cv)
@@ -538,6 +603,10 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
                     reader.offset = reader.offset + 1
                     break
                 }
+                if arr_count >= reader.max_array_elements {
+                    free_value(cv)
+                    return null, "cbor: max array elements exceeded"
+                }
                 child, err = parse_item(r, depth + 1)
                 if err != "" {
                     free_value(cv)
@@ -545,6 +614,7 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
                 }
                 string.release(err)
                 _ = list.add(cv.list_val, child)
+                arr_count = arr_count + 1
             }
             return cv as ptr, ""
         }
@@ -555,15 +625,18 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
         }
         string.release(err)
         cv.ind = ind_of(ai)
-        // Every element takes at least one byte, so a count beyond what is
-        // left is truncated input, refused before the loop rather than
-        // narrowed to int (2^32 became 0 elements).
-        if len_val < 0 || len_val > ((reader.len - reader.offset) as long) {
+        rem = (reader.len - reader.offset) as long
+        if len_val < 0 || len_val > rem {
             free_value(cv)
             return null, "cbor: unexpected EOF"
         }
+        if len_val > (reader.max_array_elements as long) {
+            free_value(cv)
+            return null, "cbor: max array elements exceeded"
+        }
         i = 0
-        while i < (len_val as int) {
+        n = len_val as int
+        while i < n {
             child, err = parse_item(r, depth + 1)
             if err != "" {
                 free_value(cv)
@@ -583,7 +656,12 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
         cv.map_keys = list.new()
         cv.map_values = list.new()
         if ai == 31 {
+            if reader.allow_indefinite == 0 {
+                free_value(cv)
+                return null, "cbor: indefinite-length items are disabled"
+            }
             cv.indefinite = 1
+            map_count = 0
             while true {
                 if reader.offset >= reader.len {
                     free_value(cv)
@@ -594,14 +672,26 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
                     reader.offset = reader.offset + 1
                     break
                 }
+                if map_count >= reader.max_map_pairs {
+                    free_value(cv)
+                    return null, "cbor: max map pairs exceeded"
+                }
                 key_cv, err = parse_item(r, depth + 1)
                 if err != "" {
                     free_value(cv)
                     return null, err
                 }
                 string.release(err)
-                // A break here, where the value belongs, is not the end of
-                // the map: parse_item refuses it as an unexpected break.
+
+                if reader.allow_duplicate_keys == 0 {
+                    if map_has_duplicate_key(cv as *CborValue, key_cv) {
+                        dup_err = duplicate_key_error(key_cv)
+                        free_value(key_cv)
+                        free_value(cv)
+                        return null, dup_err
+                    }
+                }
+
                 val_cv, err2 = parse_item(r, depth + 1)
                 if err2 != "" {
                     free_value(key_cv)
@@ -611,6 +701,7 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
                 string.release(err2)
                 _ = list.add(cv.map_keys, key_cv)
                 _ = list.add(cv.map_values, val_cv)
+                map_count = map_count + 1
             }
             return cv as ptr, ""
         }
@@ -621,19 +712,34 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
         }
         string.release(err)
         cv.ind = ind_of(ai)
-        // Every entry is a key and a value, at least two bytes.
-        if len_val < 0 || len_val > ((reader.len - reader.offset) as long) / 2 {
+        rem = (reader.len - reader.offset) as long
+        if len_val < 0 || len_val > rem / 2 {
             free_value(cv)
             return null, "cbor: unexpected EOF"
         }
+        if len_val > (reader.max_map_pairs as long) {
+            free_value(cv)
+            return null, "cbor: max map pairs exceeded"
+        }
         i = 0
-        while i < (len_val as int) {
+        n = len_val as int
+        while i < n {
             key_cv, err = parse_item(r, depth + 1)
             if err != "" {
                 free_value(cv)
                 return null, err
             }
             string.release(err)
+
+            if reader.allow_duplicate_keys == 0 {
+                if map_has_duplicate_key(cv as *CborValue, key_cv) {
+                    dup_err = duplicate_key_error(key_cv)
+                    free_value(key_cv)
+                    free_value(cv)
+                    return null, dup_err
+                }
+            }
+
             val_cv, err2 = parse_item(r, depth + 1)
             if err2 != "" {
                 free_value(key_cv)
@@ -700,11 +806,8 @@ parse_item(r: ptr, depth: int) -> (ptr, string) {
     return null, "cbor: invalid additional information"
 }
 
-// Parse one CBOR data item that is the whole of `cbor_data`. Returns
-// (value_ptr, "") on success, (null, error) on failure. Caller owns the
-// returned value and must free with cbor.free. Bytes left after the item are
-// an error (#2470): `0102` used to parse as 1.
-parse(cbor_data: string) -> ptr! {
+// Parse one CBOR data item that is the whole of `cbor_data` with options.
+parse_with(cbor_data: string, opts: CborDecodeOptions) -> ptr! {
     ok = ""
     dlen = string.length(cbor_data)
     // Copy the input into an owned bytes buffer. We must NOT store the
@@ -718,6 +821,12 @@ parse(cbor_data: string) -> ptr! {
     r.buf = buf
     r.len = dlen
     r.offset = 0
+    r.max_depth = opts.max_depth
+    r.max_array_elements = opts.max_array_elements
+    r.max_map_pairs = opts.max_map_pairs
+    r.allow_duplicate_keys = opts.allow_duplicate_keys
+    r.allow_indefinite = opts.allow_indefinite
+
     res, err = parse_item(r as ptr, 0)
     trailing = r.offset < r.len
     bytes.free(r.buf)
@@ -733,6 +842,11 @@ parse(cbor_data: string) -> ptr! {
         return null, "cbor: trailing bytes after the data item"
     }
     return res, ok
+}
+
+// Parse one CBOR data item using safe default options.
+parse(cbor_data: string) -> ptr! {
+    return parse_with(cbor_data, default_decode_options())
 }
 
 // ---- ENCODER IMPLEMENTATION ----
@@ -802,6 +916,10 @@ encode_head(w: ptr, major: int, val: long, ind: int) {
         write_byte(w, base | 27)
         write_be64(w, val)
     }
+}
+
+fn encode_head_preferred(w: ptr, major: int, val: long) {
+    encode_head(w, major, val, 0)
 }
 
 // ---- Float widths: ind 2 is half, 3 single, 4 double ----
@@ -1058,6 +1176,250 @@ encode(value: ptr) -> string! {
 // Alias of encode for JSON symmetry.
 stringify(value: ptr) -> string! {
     return encode(value)
+}
+
+fn bytes_lex_cmp(s1: string, s2: string) -> int {
+    l1 = string.length(s1)
+    l2 = string.length(s2)
+    min_l = l1
+    if l2 < min_l { min_l = l2 }
+    i = 0
+    while i < min_l {
+        b1 = string.char_at_n(s1, l1, i) & 255
+        b2 = string.char_at_n(s2, l2, i) & 255
+        if b1 < b2 { return -1 }
+        if b1 > b2 { return 1 }
+        i = i + 1
+    }
+    if l1 < l2 { return -1 }
+    if l1 > l2 { return 1 }
+    return 0
+}
+
+encode_deterministic_item(w: ptr, cv: ptr) -> string {
+    if cv == null {
+        write_byte(w, 246)
+        return ""
+    }
+
+    cv_val = cv as *CborValue
+    if cv_val.type == CBOR_INT {
+        v = cv_val.int_val
+        if cv_val.big == 1 {
+            encode_head_preferred(w, 0, v)
+        } else if cv_val.big == 2 {
+            encode_head_preferred(w, 1, v)
+        } else if v >= 0 {
+            encode_head_preferred(w, 0, v)
+        } else {
+            encode_head_preferred(w, 1, -1 - v)
+        }
+        return ""
+    }
+    if cv_val.type == CBOR_BYTES || cv_val.type == CBOR_TEXT {
+        major = 2
+        if cv_val.type == CBOR_TEXT {
+            major = 3
+        }
+        // RFC 8949 §4.2.1: Re-encode indefinite string as definite string using payload
+        len = cv_val.str_len
+        encode_head_preferred(w, major, len as long)
+        if len > 0 {
+            s = str_payload_string(cv_val)
+            write_string(w, s, len)
+            string.release(s)
+        }
+        return ""
+    }
+    if cv_val.type == CBOR_ARRAY {
+        n = list.size(cv_val.list_val)
+        encode_head_preferred(w, 4, n as long)
+        i = 0
+        while i < n {
+            item, _ = list.get(cv_val.list_val, i)
+            err = encode_deterministic_item(w, item)
+            if err != "" { return err }
+            i = i + 1
+        }
+        return ""
+    }
+    if cv_val.type == CBOR_MAP {
+        n = list.size(cv_val.map_keys)
+        if n == 0 {
+            encode_head_preferred(w, 5, 0 as long)
+            return ""
+        }
+        pairs = list.new()
+        i = 0
+        var map_err = ""
+        while i < n {
+            k, _ = list.get(cv_val.map_keys, i)
+            v, _ = list.get(cv_val.map_values, i)
+            ek, kerr = encode_deterministic(k)
+            if kerr != "" {
+                map_err = kerr
+                break
+            }
+            ev, verr = encode_deterministic(v)
+            if verr != "" {
+                string.release(ek)
+                map_err = verr
+                break
+            }
+            p = heap.new(MapPair)
+            p.key = k
+            p.val = v
+            p.enc_k = ek
+            p.enc_v = ev
+            _ = list.add(pairs, p as ptr)
+            i = i + 1
+        }
+        if map_err != "" {
+            num_pairs = list.size(pairs)
+            p_idx = 0
+            while p_idx < num_pairs {
+                p = list.get_raw(pairs, p_idx) as *MapPair
+                string.release(p.enc_k)
+                string.release(p.enc_v)
+                heap.free(p)
+                p_idx = p_idx + 1
+            }
+            list.free(pairs)
+            return map_err
+        }
+
+        // Insertion sort on pairs
+        var sort_i = 1
+        while sort_i < n {
+            p_i_ptr, _ = list.get(pairs, sort_i)
+            p_i = p_i_ptr as *MapPair
+            var sort_j = sort_i - 1
+            while sort_j >= 0 {
+                p_j_ptr, _ = list.get(pairs, sort_j)
+                p_j = p_j_ptr as *MapPair
+                cmp = bytes_lex_cmp(p_j.enc_k, p_i.enc_k)
+                if cmp > 0 {
+                    list.set(pairs, sort_j + 1, p_j as ptr)
+                    sort_j = sort_j - 1
+                } else {
+                    break
+                }
+            }
+            list.set(pairs, sort_j + 1, p_i as ptr)
+            sort_i = sort_i + 1
+        }
+
+        // Check for duplicate key encodings
+        var check_i = 0
+        while check_i < n - 1 {
+            p_a = list.get_raw(pairs, check_i) as *MapPair
+            p_b = list.get_raw(pairs, check_i + 1) as *MapPair
+            if bytes_lex_cmp(p_a.enc_k, p_b.enc_k) == 0 {
+                map_err = duplicate_key_error(p_a.key)
+                break
+            }
+            check_i = check_i + 1
+        }
+
+        if map_err != "" {
+            num_pairs = list.size(pairs)
+            p_idx = 0
+            while p_idx < num_pairs {
+                p = list.get_raw(pairs, p_idx) as *MapPair
+                string.release(p.enc_k)
+                string.release(p.enc_v)
+                heap.free(p)
+                p_idx = p_idx + 1
+            }
+            list.free(pairs)
+            return map_err
+        }
+
+        // Write map head and sorted pairs
+        encode_head_preferred(w, 5, n as long)
+        var write_i = 0
+        while write_i < n {
+            p = list.get_raw(pairs, write_i) as *MapPair
+            write_string(w, p.enc_k, string.length(p.enc_k))
+            write_string(w, p.enc_v, string.length(p.enc_v))
+            write_i = write_i + 1
+        }
+
+        // Clean up temporary pairs list and string references
+        p_idx = 0
+        while p_idx < n {
+            p = list.get_raw(pairs, p_idx) as *MapPair
+            string.release(p.enc_k)
+            string.release(p.enc_v)
+            heap.free(p)
+            p_idx = p_idx + 1
+        }
+        list.free(pairs)
+        return ""
+    }
+    if cv_val.type == CBOR_TAG {
+        encode_head_preferred(w, 6, cv_val.tag_val)
+        err = encode_deterministic_item(w, cv_val.tag_child)
+        return err
+    }
+    if cv_val.type == CBOR_SIMPLE {
+        v = cv_val.int_val
+        if v < 24 {
+            write_byte(w, 224 | (v as int))
+        } else {
+            write_byte(w, 224 | 24)
+            write_byte(w, v as int)
+        }
+        return ""
+    }
+    if cv_val.type == CBOR_FLOAT {
+        var width = 4
+        if cv_val.ind != 0 && is_nan(cv_val.float_val) {
+            width = float_preferred(cv_val)
+        } else {
+            width = float_width_for(cv_val.float_val)
+        }
+        if width == 2 {
+            write_byte(w, 249)
+            if cv_val.ind == 2 && is_nan(cv_val.float_val) {
+                write_be16(w, cv_val.int_val as int)
+            } else {
+                write_be16(w, half_bits(cv_val.float_val))
+            }
+        } else if width == 3 {
+            write_byte(w, 250)
+            if cv_val.ind == 3 && is_nan(cv_val.float_val) {
+                write_be32(w, cv_val.int_val as int)
+            } else {
+                write_be32(w, single_bits(cv_val.float_val) as int)
+            }
+        } else {
+            write_byte(w, 251)
+            if cv_val.ind == 4 && is_nan(cv_val.float_val) {
+                write_be64(w, cv_val.int_val)
+            } else {
+                write_be64(w, mem.bits_of_float(cv_val.float_val))
+            }
+        }
+        return ""
+    }
+    return "cbor: unsupported CBOR value type for encoding"
+}
+
+// Deterministic CBOR encoding (RFC 8949 §4.2 Core Deterministic Encoding).
+encode_deterministic(value: ptr) -> string! {
+    w = heap.new(Writer)
+    w.buf = bytes.new(32)
+    w.offset = 0
+    err = encode_deterministic_item(w as ptr, value)
+    if err != "" {
+        bytes.free(w.buf)
+        heap.free(w)
+        return "", err
+    }
+    res = bytes.finish(w.buf, w.offset)
+    heap.free(w)
+    return res, ""
 }
 
 // ---- ERGONOMIC GETTERS ----

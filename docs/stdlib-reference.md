@@ -23,7 +23,7 @@ header comment is the authoritative description.
 | `std.capsicum` | FreeBSD Capsicum capability-mode bindings. | 28 | [guide](../std/capsicum/README.md) · [source](../std/capsicum/module.ae) |
 | `std.cas` | Content-addressed store keyed by the sha256 of file contents. | 7 | [guide](../std/cas/README.md) · [source](../std/cas/module.ae) |
 | `std.casper` | FreeBSD Casper service delegation. | 8 | [guide](../std/casper/README.md) · [source](../std/casper/module.ae) |
-| `std.cbor` | CBOR encoding and decoding (RFC 8949). | 46 | [guide](../std/cbor/README.md) · [source](../std/cbor/module.ae) |
+| `std.cbor` | CBOR encoding and decoding (RFC 8949). | 50 | [guide](../std/cbor/README.md) · [source](../std/cbor/module.ae) |
 | `std.clapae` | Command-line argument parser, modelled on clap. | 32 | [guide](../std/clapae/README.md) · [source](../std/clapae/module.ae) |
 | `std.collections` | Dynamic list, hash map and packed int array, with the raw externs the alias modules re-export. | 44 | [guide](../std/collections/README.md) · [source](../std/collections/module.ae) |
 | `std.config` | Process-global immutable string to string store. | 6 | [guide](../std/config/README.md) · [source](../std/config/module.ae) |

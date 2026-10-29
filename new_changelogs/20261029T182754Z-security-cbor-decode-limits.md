@@ -1,0 +1,1 @@
+- **`std.cbor`**: Added `CborDecodeOptions` with safe defaults (`parse_with`), duplicate map key rejection by default, declared length and container element bounds enforcement, and `encode_deterministic` (RFC 8949 §4.2 Core Deterministic Encoding).

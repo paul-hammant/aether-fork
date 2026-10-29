@@ -1,0 +1,325 @@
+// Hardening test suite for std.cbor
+// Tests CborDecodeOptions, duplicate map keys, length bombs, indefinite length limits,
+// and RFC 8949 §4.2 Core Deterministic Encoding.
+//
+// Reference semantics and test vectors cited from fxamacker/cbor (MIT).
+
+import std.cbor
+import std.encoding
+import std.string
+import std.bytes
+import std.mem
+
+extern exit(code: int)
+
+fn expect_parse_with_error(hex_data: string, opts: cbor.CborDecodeOptions, expected_err: string) -> int {
+    binary_data, err = encoding.hex_decode(hex_data)
+    if err != "" {
+        println("  FAIL: hex decode failed for ${hex_data}: ${err}")
+        return 1
+    }
+    cv_ptr, err2 = cbor.parse_with(binary_data, opts)
+    if err2 != expected_err {
+        diag, _ = cbor.diagnose(cv_ptr)
+        println("  FAIL parse_with: ${hex_data} should be refused")
+        println("    got:      err='${err2}' value=${diag}")
+        println("    expected: err='${expected_err}'")
+        cbor.free(cv_ptr)
+        return 1
+    }
+    if cv_ptr != null {
+        cbor.free(cv_ptr)
+    }
+    return 0
+}
+
+fn expect_parse_error(hex_data: string, expected_err: string) -> int {
+    return expect_parse_with_error(hex_data, cbor.default_decode_options(), expected_err)
+}
+
+fn run_parse_with_ok(hex_data: string, opts: cbor.CborDecodeOptions, expected_diag: string) -> int {
+    binary_data, err = encoding.hex_decode(hex_data)
+    if err != "" {
+        println("  FAIL: hex decode failed for ${hex_data}: ${err}")
+        return 1
+    }
+    cv_ptr, err2 = cbor.parse_with(binary_data, opts)
+    if err2 != "" {
+        println("  FAIL parse_with ok: ${hex_data} failed with err: ${err2}")
+        return 1
+    }
+    diag, _ = cbor.diagnose(cv_ptr)
+    if diag != expected_diag {
+        println("  FAIL parse_with diag mismatch for ${hex_data}: got '${diag}', want '${expected_diag}'")
+        cbor.free(cv_ptr)
+        return 1
+    }
+    cbor.free(cv_ptr)
+    return 0
+}
+
+// Citation: fxamacker/cbor decode_test.go TestDecodeDupMapKey
+fn test_duplicate_keys() -> int {
+    f = 0
+    // Same text key "grant" ("grant": "none", "grant": "all") -> refused by default
+    // hex: a2 65 67 72 61 6e 74 64 6e 6f 6e 65 65 67 72 61 6e 74 63 61 6c 6c
+    dup_text = "a2656772616e74646e6f6e65656772616e7463616c6c"
+    f = f + expect_parse_error(dup_text, "cbor: duplicate map key \"grant\"")
+
+    // With allow_duplicate_keys = 1, duplicate text key is accepted
+    opts_allow_dup = cbor.default_decode_options()
+    opts_allow_dup.allow_duplicate_keys = 1
+    f = f + run_parse_with_ok(dup_text, opts_allow_dup, "{\"grant\": \"none\", \"grant\": \"all\"}")
+
+    // Duplicate text key where one key is definite "a" (6161) and one is indefinite "a" (7f6161ff)
+    // hex: a2 61 61 01 7f 61 61 ff 02
+    dup_indef_key = "a26161017f6161ff02"
+    f = f + expect_parse_error(dup_indef_key, "cbor: duplicate map key \"a\"")
+
+    // Integer keys duplicate: {1: 10, 1: 20}
+    // hex: a2 01 0a 01 14
+    dup_int = "a2010a0114"
+    f = f + expect_parse_error(dup_int, "cbor: duplicate map key 1")
+
+    // Nested map duplicate keys: {1: {"grant": "none", "grant": "all"}}
+    // hex: a1 01 a2 65 67 72 61 6e 74 64 6e 6f 6e 65 65 67 72 61 6e 74 63 61 6c 6c
+    nested_dup = "a101a2656772616e74646e6f6e65656772616e7463616c6c"
+    f = f + expect_parse_error(nested_dup, "cbor: duplicate map key \"grant\"")
+
+    // Integer key 1 and text key "1" in same map: {1: "int", "1": "str"} -> accepted (different types)
+    // hex: a2 01 63 69 6e 74 61 31 63 73 74 72
+    int_vs_str_key = "a20163696e74613163737472"
+    f = f + run_parse_with_ok(int_vs_str_key, cbor.default_decode_options(), "{1: \"int\", \"1\": \"str\"}")
+
+    if f == 0 { println("  PASS: duplicate map key tests") }
+    return f
+}
+
+// Citation: fxamacker/cbor decode_test.go TestDecodeLengthBomb
+fn test_length_bombs() -> int {
+    f = 0
+    // Byte string claiming ~2^32 bytes in 5 bytes input
+    f = f + expect_parse_error("5affffffff", "cbor: unexpected EOF")
+    f = f + expect_parse_error("5a80000000", "cbor: unexpected EOF")
+
+    // Byte string claiming ~2^64 bytes in 9 bytes input
+    f = f + expect_parse_error("5bffffffffffffffff", "cbor: unexpected EOF")
+
+    // Array claiming ~2^32 elements in 5 bytes input
+    f = f + expect_parse_error("9affffffff", "cbor: unexpected EOF")
+    f = f + expect_parse_error("9a80000000", "cbor: unexpected EOF")
+
+    // Array claiming ~2^64 elements in 9 bytes input
+    f = f + expect_parse_error("9bffffffffffffffff", "cbor: unexpected EOF")
+
+    // Map claiming ~2^32 pairs in 5 bytes input
+    f = f + expect_parse_error("baffffffff", "cbor: unexpected EOF")
+    f = f + expect_parse_error("ba80000000", "cbor: unexpected EOF")
+
+    // Map claiming ~2^64 pairs in 9 bytes input
+    f = f + expect_parse_error("bbffffffffffffffff", "cbor: unexpected EOF")
+
+    if f == 0 { println("  PASS: length bomb tests") }
+    return f
+}
+
+// Citation: fxamacker/cbor decode_opts_test.go TestDecOptions
+fn test_option_boundaries() -> int {
+    f = 0
+
+    // --- max_depth ---
+    opts_depth = cbor.default_decode_options()
+    opts_depth.max_depth = 4
+    // Nesting depth 4: [[[[1]]]] -> 4 nesting levels around integer 1 -> accepted
+    // hex: 81 81 81 81 01
+    nest4 = "8181818101"
+    f = f + run_parse_with_ok(nest4, opts_depth, "[[[[1]]]]")
+
+    // Nesting depth 5: [[[[[1]]]]] -> 5 nesting levels -> refused with custom limit message
+    // hex: 81 81 81 81 81 01
+    nest5 = "818181818101"
+    f = f + expect_parse_with_error(nest5, opts_depth, "cbor: nesting deeper than 4")
+
+    // --- max_array_elements ---
+    opts_arr = cbor.default_decode_options()
+    opts_arr.max_array_elements = 3
+    // Array of 3 elements [1, 2, 3] -> accepted
+    // hex: 83 01 02 03
+    arr3 = "83010203"
+    f = f + run_parse_with_ok(arr3, opts_arr, "[1, 2, 3]")
+
+    // Array of 4 elements [1, 2, 3, 4] -> refused
+    // hex: 84 01 02 03 04
+    arr4 = "8401020304"
+    f = f + expect_parse_with_error(arr4, opts_arr, "cbor: max array elements exceeded")
+
+    // Indefinite array with 3 elements -> accepted
+    // hex: 9f 01 02 03 ff
+    indef_arr3 = "9f010203ff"
+    f = f + run_parse_with_ok(indef_arr3, opts_arr, "[_ 1, 2, 3]")
+
+    // Indefinite array with 4 elements -> refused
+    // hex: 9f 01 02 03 04 ff
+    indef_arr4 = "9f01020304ff"
+    f = f + expect_parse_with_error(indef_arr4, opts_arr, "cbor: max array elements exceeded")
+
+    // --- max_map_pairs ---
+    opts_map = cbor.default_decode_options()
+    opts_map.max_map_pairs = 2
+    // Map with 2 pairs {1: 10, 2: 20} -> accepted
+    // hex: a2 01 0a 02 14
+    map2 = "a2010a0214"
+    f = f + run_parse_with_ok(map2, opts_map, "{1: 10, 2: 20}")
+
+    // Map with 3 pairs {1: 10, 2: 20, 3: 30} -> refused
+    // hex: a3 01 0a 02 14 03 1e
+    map3 = "a3010a0214031e"
+    f = f + expect_parse_with_error(map3, opts_map, "cbor: max map pairs exceeded")
+
+    // Indefinite map with 2 pairs -> accepted
+    // hex: bf 01 0a 02 14 ff
+    indef_map2 = "bf010a0214ff"
+    f = f + run_parse_with_ok(indef_map2, opts_map, "{_ 1: 10, 2: 20}")
+
+    // Indefinite map with 3 pairs -> refused
+    // hex: bf 01 0a 02 14 03 1e ff
+    indef_map3 = "bf010a0214031eff"
+    f = f + expect_parse_with_error(indef_map3, opts_map, "cbor: max map pairs exceeded")
+
+    // --- allow_indefinite ---
+    opts_no_indef = cbor.default_decode_options()
+    opts_no_indef.allow_indefinite = 0
+    // Indefinite string, array, and map refused
+    f = f + expect_parse_with_error("7f6161ff", opts_no_indef, "cbor: indefinite-length items are disabled")
+    f = f + expect_parse_with_error("9f0102ff", opts_no_indef, "cbor: indefinite-length items are disabled")
+    f = f + expect_parse_with_error("bf616101ff", opts_no_indef, "cbor: indefinite-length items are disabled")
+
+    if f == 0 { println("  PASS: option boundary tests") }
+    return f
+}
+
+// Citation: fxamacker/cbor encode_test.go TestCoreDetEnc
+fn test_deterministic_encoding() -> int {
+    f = 0
+
+    // Unsorted map keys: {"b": 2, "a": 1}
+    // Parses and re-encodes deterministically with keys sorted: {"a": 1, "b": 2}
+    // hex: a2 61 62 02 61 61 01 -> sorted hex: a2 61 61 01 61 62 02
+    unsorted_map_hex = "a2616202616101"
+    bin1, _ = encoding.hex_decode(unsorted_map_hex)
+    v1, err1 = cbor.parse(bin1)
+    if err1 != "" { println("  FAIL det enc parse unsorted: ${err1}") return 1 }
+    det1, derr1 = cbor.encode_deterministic(v1)
+    if derr1 != "" { println("  FAIL det enc unsorted: ${derr1}") cbor.free(v1); return 1 }
+    det1_hex = encoding.hex_encode(string.bytes(det1)[0..string.length(det1)])
+    if det1_hex != "a2616101616202" {
+        println("  FAIL det enc map key sort: got ${det1_hex}, want a2616101616202")
+        f = f + 1
+    }
+
+    // Roundtrip property: parse(encode_deterministic(v)) then encode_deterministic again gives identical bytes
+    v1_back, _ = cbor.parse(det1)
+    det1_again, _ = cbor.encode_deterministic(v1_back)
+    det1_again_hex = encoding.hex_encode(string.bytes(det1_again)[0..string.length(det1_again)])
+    if det1_again_hex != det1_hex {
+        println("  FAIL det enc roundtrip mismatch: got ${det1_again_hex}, want ${det1_hex}")
+        f = f + 1
+    }
+    cbor.free(v1)
+    cbor.free(v1_back)
+    string.release(det1)
+    string.release(det1_again)
+
+    // Non-preferred integer serialization: 255 encoded in 2-byte head (0x1900ff)
+    // encode_deterministic re-encodes to preferred 1-byte head (0x18ff)
+    bin2, _ = encoding.hex_decode("1900ff")
+    v2, _ = cbor.parse(bin2)
+    det2, _ = cbor.encode_deterministic(v2)
+    det2_hex = encoding.hex_encode(string.bytes(det2)[0..string.length(det2)])
+    if det2_hex != "18ff" {
+        println("  FAIL det enc preferred int: got ${det2_hex}, want 18ff")
+        f = f + 1
+    }
+    cbor.free(v2)
+    string.release(det2)
+
+    // Float width narrowing: 1.5 in double precision (fb3ff8000000000000)
+    // encode_deterministic re-encodes to half precision (f93e00)
+    bin3, _ = encoding.hex_decode("fb3ff8000000000000")
+    v3, _ = cbor.parse(bin3)
+    det3, _ = cbor.encode_deterministic(v3)
+    det3_hex = encoding.hex_encode(string.bytes(det3)[0..string.length(det3)])
+    if det3_hex != "f93e00" {
+        println("  FAIL det enc float 1.5 shrink to half: got ${det3_hex}, want f93e00")
+        f = f + 1
+    }
+    cbor.free(v3)
+    string.release(det3)
+
+    // Float 100000.0 (single float, fa47c35000) stays single float
+    bin4, _ = encoding.hex_decode("fa47c35000")
+    v4, _ = cbor.parse(bin4)
+    det4, _ = cbor.encode_deterministic(v4)
+    det4_hex = encoding.hex_encode(string.bytes(det4)[0..string.length(det4)])
+    if det4_hex != "fa47c35000" {
+        println("  FAIL det enc float 100000.0 single: got ${det4_hex}, want fa47c35000")
+        f = f + 1
+    }
+    cbor.free(v4)
+    string.release(det4)
+
+    // Indefinite array re-encoded as definite array: [_ 1, 2] (9f0102ff) -> [1, 2] (820102)
+    bin5, _ = encoding.hex_decode("9f0102ff")
+    v5, _ = cbor.parse(bin5)
+    det5, _ = cbor.encode_deterministic(v5)
+    det5_hex = encoding.hex_encode(string.bytes(det5)[0..string.length(det5)])
+    if det5_hex != "820102" {
+        println("  FAIL det enc indef array to def: got ${det5_hex}, want 820102")
+        f = f + 1
+    }
+    cbor.free(v5)
+    string.release(det5)
+
+    // Indefinite string re-encoded as definite string: (_ "a", "b") (7f61616162ff) -> "ab" (626162)
+    bin6, _ = encoding.hex_decode("7f61616162ff")
+    v6, _ = cbor.parse(bin6)
+    det6, _ = cbor.encode_deterministic(v6)
+    det6_hex = encoding.hex_encode(string.bytes(det6)[0..string.length(det6)])
+    if det6_hex != "626162" {
+        println("  FAIL det enc indef string to def: got ${det6_hex}, want 626162")
+        f = f + 1
+    }
+    cbor.free(v6)
+    string.release(det6)
+
+    // Map with duplicate keys passed to encode_deterministic returns an error
+    m_dup = cbor.obj()
+    _ = cbor.map_push(m_dup, cbor.str("grant"), cbor.str("none"))
+    _ = cbor.map_push(m_dup, cbor.str("grant"), cbor.str("all"))
+    _, det_dup_err = cbor.encode_deterministic(m_dup)
+    if det_dup_err != "cbor: duplicate map key \"grant\"" {
+        println("  FAIL det enc map with duplicate key: got err '${det_dup_err}', want 'cbor: duplicate map key \"grant\"'")
+        f = f + 1
+    }
+    cbor.free(m_dup)
+
+    if f == 0 { println("  PASS: deterministic encoding tests") }
+    return f
+}
+
+main() {
+    println("=== test_cbor_hardening ===")
+    fails = 0
+
+    fails = fails + test_duplicate_keys()
+    fails = fails + test_length_bombs()
+    fails = fails + test_option_boundaries()
+    fails = fails + test_deterministic_encoding()
+
+    if fails != 0 {
+        println("CBOR HARDENING: ${fails} failure(s)")
+        exit(1)
+    }
+    println("PASS: test_cbor_hardening")
+    println("=== test_cbor_hardening passed ===")
+}

@@ -59,11 +59,47 @@ and argument sizes. A value built with the constructors encodes in preferred
 serialization: the shortest head, and a float in the narrowest width that
 holds it exactly (`num(1.5)` is `f93e00`).
 
+### Decode Options
+
+`parse_with(data, opts)` parses input with configurable decoder bounds and policy options:
+
+```aether,fragment
+struct CborDecodeOptions {
+    max_depth: int           // default 256
+    max_array_elements: int  // default 131072
+    max_map_pairs: int       // default 131072
+    allow_duplicate_keys: int  // default 0 (refuse)
+    allow_indefinite: int    // default 1
+}
+default_decode_options() -> CborDecodeOptions
+parse_with(cbor_data: string, opts: CborDecodeOptions) -> ptr!
+```
+
+`parse(data)` calls `parse_with(data, default_decode_options())`. **By default, `parse` refuses duplicate map keys** (`cbor: duplicate map key ...`), preventing parser-differential vulnerabilities.
+
+- **Duplicate keys:** Two keys are duplicates when their decoded key values are equal as values (e.g. text key `"a"` encoded definite vs indefinite). Integer `1` and text `"1"` remain distinct keys.
+- **Declared bounds & limits:** Before allocating or looping, declared string lengths, array element counts, and map pair counts are checked against remaining input bytes and option limits (`max_array_elements`, `max_map_pairs`).
+- **Indefinite items:** Setting `allow_indefinite = 0` refuses indefinite-length strings, arrays, and maps (`cbor: indefinite-length items are disabled`).
+
+### Deterministic Encoding
+
+```aether,fragment
+encode_deterministic(value: ptr) -> string!
+```
+
+`encode_deterministic` encodes values using RFC 8949 §4.2 Core Deterministic Encoding rules:
+- Preferred serialization: shortest argument heads and narrowest exact float widths (half, single, double).
+- Re-encodes indefinite-length strings, arrays, and maps as definite-length items.
+- Map keys are sorted in the bytewise lexicographic order of their deterministic encodings.
+- A map with duplicate keys returns an encoding error rather than silently encoding.
+- Use `encode_deterministic` when CBOR messages must be hashed, signed, or compared byte-exact. `encode` retains its byte-for-byte roundtrip behavior.
+
 `parse` treats its input as untrusted, and reads one data item that must be
 the whole input. It refuses, with an error rather than a value:
 
 - bytes after the item (`cbor: trailing bytes after the data item`): `0102`
   is not 1;
+- duplicate map keys (`cbor: duplicate map key ...`);
 - anything that is not well-formed (RFC 8949 §3, every case of Appendix F):
   a reserved additional-information value, a break outside an
   indefinite-length item or where a map value belongs
@@ -72,8 +108,7 @@ the whole input. It refuses, with an error rather than a value:
   bytes, a truncated head or body;
 - a text string, or a text chunk, that is not UTF-8
   (`cbor: invalid UTF-8 in text string`);
-- nesting deeper than 256 levels, the same limit as `std.json`
-  (`cbor: nesting deeper than 256`);
+- nesting deeper than `max_depth` levels (default 256, the same limit as `std.json`);
 - a string length, or an array or map count, larger than the bytes left in
   the input, 2^63 and up included (`cbor: unexpected EOF`).
 
@@ -96,6 +131,7 @@ specifies it.
 
 ## Exports
 
-`parse`, `encode`, `diagnose`, `from_int`, `from_uint`, `from_nint`, `num`,
+`parse`, `parse_with`, `CborDecodeOptions`, `default_decode_options`, `encode`,
+`encode_deterministic`, `diagnose`, `from_int`, `from_uint`, `from_nint`, `num`,
 `str`, `arr`, `obj`, `boolean`, `null_value`, `get_long`, `get_int64`,
 `get_uint`, `get_nint`, `free`, and the `CBOR_*` type constants.
