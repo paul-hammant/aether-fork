@@ -1,0 +1,121 @@
+import std.cbor
+import std.bytes
+import std.string
+
+extern abort()
+
+// Compare two binary strings byte-for-byte.
+fn same_bytes(s1: string, s2: string) -> bool {
+    l1 = string.length(s1)
+    l2 = string.length(s2)
+    if l1 != l2 {
+        return false
+    }
+    i = 0
+    while i < l1 {
+        if string.char_at_n(s1, l1, i) != string.char_at_n(s2, l2, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Oracle function called for each fuzzer input.
+// data: raw pointer to input bytes
+// len: input length in bytes
+// Helper to verify that binary input arrives whole without NUL truncation:
+// input '41 00' must decode to CBOR_BYTES of length 1.
+// Returns 1 if valid, 0 otherwise.
+fuzz_check_nul(data: ptr, len: int) -> int {
+    if len != 2 { return 0 }
+    x = bytes.string_from_ptr(data, len)
+    v, err = cbor.parse(x)
+    if err != "" {
+        return 0
+    }
+    t = cbor.type(v)
+    if t != cbor.CBOR_BYTES {
+        cbor.free(v)
+        return 0
+    }
+    b_str, b_err = cbor.get_bytes(v)
+    if b_err != "" {
+        cbor.free(v)
+        return 0
+    }
+    b_len = string.length(b_str)
+    cbor.free(v)
+    if b_len == 1 {
+        return 1
+    }
+    return 0
+}
+
+fuzz_target(data: ptr, len: int) {
+    if len < 0 {
+        return
+    }
+    x = bytes.string_from_ptr(data, len)
+
+    // 1. parse(x) with default options.
+    v, err = cbor.parse(x)
+    parsed_ok = (err == "")
+
+    // 2. If it parsed:
+    if parsed_ok {
+        // Exercise diagnose(v)
+        _diag, _ = cbor.diagnose(v)
+
+        // e1 = encode_deterministic(v)
+        e1, eerr = cbor.encode_deterministic(v)
+        if eerr != "" {
+            abort()
+        }
+
+        // parse(e1) must succeed
+        v_e1, perr = cbor.parse(e1)
+        if perr != "" {
+            abort()
+        }
+
+        // encode_deterministic of that value must equal e1 byte for byte
+        e2, eerr2 = cbor.encode_deterministic(v_e1)
+        if eerr2 != "" {
+            abort()
+        }
+
+        if !same_bytes(e1, e2) {
+            abort()
+        }
+
+        cbor.free(v_e1)
+        cbor.free(v)
+    }
+
+    // 3. Run parse_with again with options taken from the first input byte:
+    if len > 0 {
+        first_b = string.char_at_n(x, len, 0) & 255
+        cbor.CborDecodeOptions opts_var
+        opts_var.allow_indefinite = first_b & 1
+        opts_var.allow_duplicate_keys = (first_b >> 1) & 1
+        // small max_depth, max_array_elements and max_map_pairs (1 to 16)
+        opts_var.max_depth = 1 + ((first_b >> 2) & 15)
+        opts_var.max_array_elements = 1 + ((first_b >> 3) & 15)
+        opts_var.max_map_pairs = 1 + ((first_b >> 4) & 15)
+
+        v_var, err_var = cbor.parse_with(x, opts_var)
+        if err_var == "" {
+            cbor.free(v_var)
+        }
+
+        // Strict options (subset of defaults: allow_duplicate_keys=0, allow_indefinite=0 or 1,
+        // and small depth/array/map limits <= default limits).
+        // If a value parses under strict options, it must also parse under defaults.
+        if opts_var.allow_duplicate_keys == 0 {
+            if err_var == "" && !parsed_ok {
+                abort()
+            }
+        }
+    }
+}

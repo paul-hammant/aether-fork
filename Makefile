@@ -1412,6 +1412,10 @@ test-cross: ae stdlib
 test-windows-wine: ae stdlib
 	@bash tests/scripts/windows_wine_sweep.sh
 
+.PHONY: fuzz-cbor
+fuzz-cbor: compiler ae stdlib
+	@sh tests/fuzz/cbor/run_fuzz_cbor.sh
+
 # Test .ae source files - compiles and runs each test file.
 #
 # The shell tests run $(NPROC) at a time (SH_NPROC overrides). They were serial
