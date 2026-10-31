@@ -37,7 +37,7 @@ is the only host with it today. Who should get it, and how hard:
 **Tier-1 candidates — in-process dlopen hosts with a C value-stack to bridge
 (highest value, the Lua pattern ports directly):**
 
-- [ ] **Python** (`contrib/host/python`) — HIGHEST value after Lua. CPython's
+- [x] **Python** (`contrib/host/python`) — HIGHEST value after Lua. CPython's
   C-API has the exact shapes: `PyObject_CallObject` / `PyCFunction` for host
   callbacks, `PyArg_*` + `Py_BuildValue` for typed args/returns,
   `PyRun_String` returning a `PyObject*` for typed eval, `PyDict_SetItemString`

@@ -112,6 +112,85 @@ main() {
 }
 ```
 
+## Bidirectional embedding (#904)
+
+The fire-and-forget `run_sandboxed` evaluates a script, but a host that uses
+Python as a first-class, callback-driven extension surface needs a **persistent,
+host-owned VM** that registers host callbacks the script can call, injects globals,
+and returns a **typed** result.
+
+```aether
+import contrib.host.python
+
+@c_callback
+app_add(vm: ptr) -> int {
+    a = python.arg_int(vm, 1)
+    b = python.arg_int(vm, 2)
+    python.push_int(vm, a + b)
+    return 1
+}
+
+main() {
+    vm = python.vm_new()
+    python.vm_register(vm, "app.math.add", app_add)
+    python.vm_set_global_str(vm, "NAME", "Aether")
+    python.vm_set_global_int(vm, "BASE", 100)
+
+    status = python.vm_eval(vm, "app.math.add(2, 3) + BASE")
+    t = python.vm_result_type(vm)
+    if t == PY_TINT { reply = python.vm_result_int(vm) }
+    python.vm_pop_result(vm)
+    python.vm_free(vm)
+}
+```
+
+| Call | Effect |
+|------|--------|
+| `python.vm_new() -> ptr` | create a persistent host-owned VM handle |
+| `python.vm_register(vm, name, fn_ptr) -> int` | register an Aether `(vm: ptr) -> int` `@c_callback` as a Python function (dotted names like `"app.math.add"` create/reuse parent modules) |
+| `python.vm_set_global_str/_int/_strlist(vm, name, v)` | inject a global before a run (string / int / string-array) |
+| `python.vm_eval(vm, code) -> int` | compile as expression or fallback to file statements, run once; leaves the single return value on the VM stack |
+| `python.vm_result_type(vm) -> int` | typed tag of the result (`PY_T*`) |
+| `python.vm_result_int/_str/_bool/_double/_bytes(vm)` | read the typed result |
+| `python.vm_pop_result(vm)` | clear the result after reading |
+| `python.vm_set_instruction_limit(vm, budget, every) -> string` | arm instruction limit via `PyEval_SetTrace`; decrements counter and repeatedly re-raises `RuntimeError("instruction limit exceeded")` |
+| `python.arg_count/_type/_str/_int/_bool/_double/_bytes(vm, i)` | **inside a callback**: read args (1-based) |
+| `python.push_int/_str/_bool/_nil/_double/_bytes(vm, v)` | **inside a callback**: push a result value |
+| `python.raise_error(vm, msg) -> int` | raise a Python `RuntimeError` from a callback: `return python.raise_error(vm, msg)`. The error is thrown into the script after the callback returns, so the callback's defers still run |
+
+Typed-value tags exported as consts: `PY_TNIL`, `PY_TBOOL`, `PY_TINT`,
+`PY_TSTR`, `PY_TTABLE`, `PY_TERR`, `PY_TOTHER`, `PY_TBYTES`, `PY_TFLOAT`.
+
+### Isolation caveats between VMs
+
+CPython maintains a single interpreter per process. A `vm` is its own `globals`
+dict (with `__builtins__` set) running on that shared interpreter. **Two VMs are
+not isolated from each other**: they share `sys.modules`, imported module state,
+and the GIL.
+
+### Binary safety: text vs bytes
+
+A `str` is text (`PY_TSTR`) and a `bytes` is binary (`PY_TBYTES`). They are never
+silently coerced to each other. `python_vm_result_bytes(vm, &out_len)` and
+`python_arg_bytes(vm, i, &out_len)` are length-aware so embedded zeros survive
+losslessly.
+
+### Integers exceeding 64 bits
+
+Python supports arbitrarily large integers, but Aether integers are 64-bit (`long`).
+Values that overflow a 64-bit signed integer (such as `2**64`) are tagged as
+`PY_TOTHER` via `PyLong_AsLongLongAndOverflow`. Calling `python_vm_result_int` or
+`python_arg_int` on an overflowing integer returns `0` rather than a wrapped or
+truncated number.
+
+### Instruction limit gap
+
+The instruction limit hooks Python bytecode via `PyEval_SetTrace`. Loops that
+execute entirely inside native C extensions (for example `sum(range(10**12))`)
+do not emit trace events and cannot be bounded by `PyEval_SetTrace`. A process
+boundary (separate sandboxed child process) is the real mitigation for native
+CPU exhaustion.
+
 ## Implementation notes
 
 - All CPython C API access goes through a `dlsym` function-pointer
@@ -159,6 +238,16 @@ Four tests exercise this host, each covering a different facet:
   enters `run_sandboxed_with_map` recursively through the embedded CPython
   process. It verifies that the inner run sees only its map, the outer map is
   restored afterward, and no token remains active after the outer return.
+
+- **Bidirectional embedding (#904)**:
+  [`tests/integration/host_python_bidirectional/`](../../../tests/integration/host_python_bidirectional/),
+  driven by
+  [`test_host_python_bidirectional.sh`](../../../tests/integration/host_python_bidirectional/test_host_python_bidirectional.sh).
+  Tests persistent VMs, dotted callback registrations, typed arguments and return
+  values (including length-aware bytes with embedded nulls and floats), injected
+  globals, statements/expression eval, exception propagation, nested eval,
+  VM globals isolation, thread concurrency under the GIL, instruction limit timeout,
+  and a 10,000 round leak test verifying refcount, gc objects, and bounded RSS growth.
 
 - **Build smoke**:
   [`tests/scripts/contrib_build.sh`](../../../tests/scripts/contrib_build.sh),
