@@ -1,0 +1,1 @@
+- **Add coverage-guided fuzz harness for std.cbor decoding.** Adds `tests/fuzz/cbor/` with a libFuzzer/ASan/UBSan harness (`fuzz_cbor.ae`, `fuzz_cbor.c`), dictionary (`cbor.dict`), seed corpus, driver script (`run_fuzz_cbor.sh`), `make fuzz-cbor` target, mutant verification script (`prove_mutants.sh`), and documentation (`tests/fuzz/README.md`).
