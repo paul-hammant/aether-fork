@@ -1412,11 +1412,16 @@ test-cross: ae stdlib
 test-windows-wine: ae stdlib
 	@bash tests/scripts/windows_wine_sweep.sh
 
-.PHONY: fuzz-cbor
+.PHONY: fuzz-cbor fuzz-msgpack
 # Coverage-guided fuzzing of std.cbor's decoder (needs clang with libFuzzer).
 # Not part of `make test` or CI; FUZZ_SECONDS sets the run time (default 60).
 fuzz-cbor: compiler ae stdlib
 	@sh tests/fuzz/cbor/run_fuzz_cbor.sh
+
+# Coverage-guided fuzzing of std.msgpack's decoder (needs clang with libFuzzer).
+# Not part of `make test` or CI; FUZZ_SECONDS sets the run time (default 60).
+fuzz-msgpack: compiler ae stdlib
+	@sh tests/fuzz/msgpack/run_fuzz_msgpack.sh
 
 # Test .ae source files - compiles and runs each test file.
 #

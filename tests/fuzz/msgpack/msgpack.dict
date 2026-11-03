@@ -1,0 +1,80 @@
+# MessagePack libFuzzer dictionary
+# Note: uses "\xNN" escapes, not "\\xNN"
+
+# Positive FixInt boundaries
+"\x00"
+"\x7f"
+
+# FixMap headers (0x80..0x8f)
+"\x80"
+"\x81"
+"\x8f"
+
+# FixArray headers (0x90..0x9f)
+"\x90"
+"\x91"
+"\x9f"
+
+# FixStr headers (0xa0..0xbf)
+"\xa0"
+"\xa1"
+"\xbf"
+
+# Nil & booleans
+"\xc0"
+"\xc2"
+"\xc3"
+
+# Reserved byte
+"\xc1"
+
+# Binary formats (bin 8, 16, 32)
+"\xc4"
+"\xc5"
+"\xc6"
+
+# Extension formats (ext 8, 16, 32)
+"\xc7"
+"\xc8"
+"\xc9"
+
+# Floats (float 32, 64)
+"\xca"
+"\xcb"
+
+# Unsigned integers (uint 8, 16, 32, 64)
+"\xcc"
+"\xcd"
+"\xce"
+"\xcf"
+
+# Signed integers (int 8, 16, 32, 64)
+"\xd0"
+"\xd1"
+"\xd2"
+"\xd3"
+
+# FixExt formats (fixext 1, 2, 4, 8, 16)
+"\xd4"
+"\xd5"
+"\xd6"
+"\xd7"
+"\xd8"
+
+# String formats (str 8, 16, 32)
+"\xd9"
+"\xda"
+"\xdb"
+
+# Array formats (array 16, 32)
+"\xdc"
+"\xdd"
+
+# Map formats (map 16, 32)
+"\xde"
+"\xdf"
+
+# Negative FixInt boundaries (0xe0..0xff)
+"\xe0"
+"\xf0"
+"\xff"

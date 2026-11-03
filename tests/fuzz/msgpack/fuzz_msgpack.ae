@@ -1,0 +1,206 @@
+// The std.msgpack fuzz target, built --emit=obj and called from fuzz_msgpack.c's
+// LLVMFuzzerTestOneInput. Beyond "doesn't crash, doesn't leak", it checks:
+//   - a value that parses re-encodes, that encoding parses, and re-encoding it
+//     gives the exact same bytes;
+//   - limits: nesting depth does not exceed MAX_DEPTH (256), and no str/bin/ext
+//     payload length or array/map size exceeds what the input's length could hold;
+//   - accessor consistency: valid type tag, sizes agree with elements retrieved,
+//     and out-of-bounds access returns null/-1 without crashing;
+//   - refusal of trailing bytes: if unpack succeeded on x, appending any byte
+//     to x must cause unpack to fail.
+// It calls abort() only when one of these checks fails; an unpack error is a pass.
+
+import std.msgpack
+import std.bytes
+import std.string
+
+extern abort()
+
+// Compare two binary strings byte for byte.
+fn same_bytes(s1: string, s2: string) -> bool {
+    l1 = string.length(s1)
+    l2 = string.length(s2)
+    if l1 != l2 {
+        return false
+    }
+    i = 0
+    while i < l1 {
+        if string.char_at_n(s1, l1, i) != string.char_at_n(s2, l2, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Whether the input reached msgpack.unpack whole: run_fuzz_msgpack.sh passes
+// the 2 bytes `a1 00`, which must decode to a 1-byte string holding NUL (0x00).
+// If cut at the NUL, it would arrive as `a1` (a truncated FixStr) and fail.
+// Returns 1 if valid, 0 otherwise.
+fn fuzz_check_nul(data: ptr, len: int) -> int {
+    if len != 2 { return 0 }
+    x = bytes.string_from_ptr(data, len)
+    v, err = msgpack.unpack(x)
+    if err != "" {
+        return 0
+    }
+    t = msgpack.get_type(v)
+    if t != msgpack.TYPE_STR {
+        msgpack.free(v)
+        return 0
+    }
+    s = msgpack.get_string(v)
+    defer string.release(s)
+    s_len = string.length(s)
+    msgpack.free(v)
+    if s_len == 1 {
+        return 1
+    }
+    return 0
+}
+
+// How depth is counted in std.msgpack:
+// In std/msgpack/module.ae, unpack(bytes_str) calls `unpack_inner(c, 0)`.
+// `unpack_inner(c, depth)` starts with `if depth > MAX_DEPTH { return null, ... }`.
+// When recursing for array elements or map keys and values, `depth + 1` is passed.
+// Thus, the root item is at depth 0, direct elements of a container at depth 1, etc.
+// A successfully decoded tree cannot have any item at depth > MAX_DEPTH (256).
+
+const HARNESS_MAX_DEPTH = 256
+
+// Recursively inspect a decoded MsgValue tree:
+// Check depth, payload sizes, container sizes, and accessor consistency.
+fn walk_value(v: ptr, depth: int, max_allowed_len: int) -> bool {
+    if v == null { return false }
+    if depth > HARNESS_MAX_DEPTH {
+        return false
+    }
+
+    t = msgpack.get_type(v)
+    if t < msgpack.TYPE_NIL || t > msgpack.TYPE_EXT {
+        return false
+    }
+
+    // Check accessor consistency for non-array / non-map types
+    if t != msgpack.TYPE_ARRAY {
+        if msgpack.array_size(v) != -1 { return false }
+        if msgpack.array_get(v, 0) != null { return false }
+        if msgpack.array_get(v, -1) != null { return false }
+    }
+
+    if t != msgpack.TYPE_MAP {
+        if msgpack.map_size(v) != -1 { return false }
+        if msgpack.map_get_key(v, 0) != null { return false }
+        if msgpack.map_get_value(v, 0) != null { return false }
+        if msgpack.map_get_key(v, -1) != null { return false }
+        if msgpack.map_get_value(v, -1) != null { return false }
+    }
+
+    if t == msgpack.TYPE_STR {
+        s = msgpack.get_string(v)
+        defer string.release(s)
+        s_len = string.length(s)
+        if s_len > max_allowed_len { return false }
+    } else if t == msgpack.TYPE_BIN {
+        b = msgpack.get_bin(v)
+        defer string.release(b)
+        b_len = string.length(b)
+        if b_len > max_allowed_len { return false }
+    } else if t == msgpack.TYPE_EXT {
+        ext_data = msgpack.get_string(v)
+        defer string.release(ext_data)
+        if string.length(ext_data) > max_allowed_len { return false }
+    } else if t == msgpack.TYPE_ARRAY {
+        asz = msgpack.array_size(v)
+        if asz < 0 || asz > max_allowed_len { return false }
+
+        // Test out-of-bounds indexing does not crash and returns null
+        if msgpack.array_get(v, -1) != null { return false }
+        if msgpack.array_get(v, asz) != null { return false }
+
+        i = 0
+        while i < asz {
+            child = msgpack.array_get(v, i)
+            if child == null { return false }
+            if !walk_value(child, depth + 1, max_allowed_len) {
+                return false
+            }
+            i = i + 1
+        }
+    } else if t == msgpack.TYPE_MAP {
+        msz = msgpack.map_size(v)
+        if msz < 0 || msz > max_allowed_len { return false }
+
+        // Test out-of-bounds indexing does not crash and returns null
+        if msgpack.map_get_key(v, -1) != null { return false }
+        if msgpack.map_get_value(v, -1) != null { return false }
+        if msgpack.map_get_key(v, msz) != null { return false }
+        if msgpack.map_get_value(v, msz) != null { return false }
+
+        i = 0
+        while i < msz {
+            k = msgpack.map_get_key(v, i)
+            val = msgpack.map_get_value(v, i)
+            if k == null || val == null { return false }
+            if !walk_value(k, depth + 1, max_allowed_len) {
+                return false
+            }
+            if !walk_value(val, depth + 1, max_allowed_len) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+
+    return true
+}
+
+// One fuzzer input: `len` bytes at `data`, zeros included.
+fn fuzz_target(data: ptr, len: int) {
+    if len <= 0 {
+        return
+    }
+    x = bytes.string_from_ptr(data, len)
+
+    v, err = msgpack.unpack(x)
+    if err != "" {
+        return
+    }
+
+    // 1. Walk the decoded tree: check limits and accessor consistency.
+    if !walk_value(v, 0, len) {
+        msgpack.free(v)
+        abort()
+    }
+
+    // 2. Trailing bytes check:
+    // Because unpack succeeded on x, appending trailing bytes to x must fail.
+    x_trailing = string.concat(x, "\x00")
+    defer string.release(x_trailing)
+    v_trail, trail_err = msgpack.unpack(x_trailing)
+    if trail_err == "" {
+        msgpack.free(v_trail)
+        msgpack.free(v)
+        abort()
+    }
+
+    // 3. Round trip check:
+    // e1 = pack(v) must unpack successfully.
+    // pack(unpack(e1)) must equal e1 byte-for-byte.
+    e1 = msgpack.pack(v)
+    v_e1, err1 = msgpack.unpack(e1)
+    if err1 != "" {
+        msgpack.free(v)
+        abort()
+    }
+
+    e2 = msgpack.pack(v_e1)
+    if !same_bytes(e1, e2) {
+        msgpack.free(v_e1)
+        msgpack.free(v)
+        abort()
+    }
+
+    msgpack.free(v_e1)
+    msgpack.free(v)
+}
