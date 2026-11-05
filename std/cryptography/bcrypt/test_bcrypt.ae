@@ -1,0 +1,159 @@
+// std.cryptography.bcrypt unit tests
+import std.cryptography.bcrypt
+import std.bytes
+import std.string
+
+hb(h: string) -> ptr {
+    n = string.length(h)
+    b = bytes.new(n / 2)
+    bytes.set_length(b, n / 2)
+    i = 0
+    while i < n {
+        c1 = string_char_at(h, i)
+        c2 = string_char_at(h, i + 1)
+        bytes.set(b, i / 2, hv(c1) * 16 + hv(c2))
+        i = i + 2
+    }
+    return b
+}
+
+hv(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return 0
+}
+
+ck(lbl: string, got: string, want: string) -> int {
+    if got == want {
+        println("ok   ${lbl}")
+        return 0
+    }
+    println("FAIL ${lbl}")
+    println("  got:  ${got}")
+    println("  want: ${want}")
+    return 1
+}
+
+ck_int(lbl: string, got: int, want: int) -> int {
+    if got == want {
+        println("ok   ${lbl}")
+        return 0
+    }
+    println("FAIL ${lbl}")
+    println("  got:  ${got}")
+    println("  want: ${want}")
+    return 1
+}
+
+main() {
+    fails = 0
+
+    // 1. Raw vectors from Bouncy Castle BCryptTest
+    // Empty password, salt = 144b3d691a7b4ecf39cf735c7fa7a79c, cost = 6
+    s1 = hb("144b3d691a7b4ecf39cf735c7fa7a79c")
+    e0 = bytes.new(0)
+    hex1 = bcrypt.hex(bytes.view(e0)[0..0], bytes.view(s1)[0..16], 6)
+    fails = fails + ck("bcrypt raw empty cost 6", hex1, "557e94f34bf286e8719a26be94ac1e16d95ef9f819dee092")
+
+    // "6100" ('a' + \0), salt = a3612d8c9a37dac2f99d94da03bd4521, cost = 6
+    s2 = hb("a3612d8c9a37dac2f99d94da03bd4521")
+    pwa0 = hb("6100")
+    hex2 = bcrypt.hex(bytes.view(pwa0)[0..2], bytes.view(s2)[0..16], 6)
+    fails = fails + ck("bcrypt raw 6100 cost 6", hex2, "e6d53831f82060dc08a2e8489ce850ce48fbf976978738f3")
+
+    // "61626300" ('abc' + \0), salt = 2a1f1dc70a3d147956a46febe3016017, cost = 6
+    s3 = hb("2a1f1dc70a3d147956a46febe3016017")
+    pwabc0 = hb("61626300")
+    hex3 = bcrypt.hex(bytes.view(pwabc0)[0..4], bytes.view(s3)[0..16], 6)
+    fails = fails + ck("bcrypt raw 61626300 cost 6", hex3, "d9a275b493bcbe1024b0ff80d330253cfdca34687d8f69e5")
+
+    // add_terminator test with 'a' (0x61): bcrypt_raw(0x61, salt, 6, add_terminator=1) == hex2
+    pwa = hb("61")
+    raw_term = bcrypt.raw(bytes.view(pwa)[0..1], bytes.view(s2)[0..16], 6, 1)
+    hex_term_buf = bytes.new(48)
+    i = 0
+    while i < 24 {
+        bb = bytes.get(raw_term, i)
+        hi = (bb >> 4) & 15; lo = bb & 15
+        chi = 48 + hi; if hi >= 10 { chi = 87 + hi }
+        clo = 48 + lo; if lo >= 10 { clo = 87 + lo }
+        bytes.set(hex_term_buf, i * 2, chi); bytes.set(hex_term_buf, i * 2 + 1, clo)
+        i = i + 1
+    }
+    hex_term = bytes.finish(hex_term_buf, 48)
+    fails = fails + ck("bcrypt raw add_terminator match", hex_term, "e6d53831f82060dc08a2e8489ce850ce48fbf976978738f3")
+    bytes.free(raw_term)
+
+    // 2. OpenBSD format vectors (Openwall / OpenBSDBCryptTest)
+    // "$2a$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW", "U*U"
+    salt_u = bcrypt.base64_decode_salt("CCCCCCCCCCCCCCCCCCCCC.")
+    h_u = bcrypt.hash_pw("U*U", bytes.view(salt_u)[0..16], 5, "2a")
+    fails = fails + ck("bcrypt 2a U*U", h_u, "$2a$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW")
+    fails = fails + ck_int("bcrypt verify U*U", bcrypt.verify("U*U", h_u), 1)
+    fails = fails + ck_int("bcrypt verify wrong U*U", bcrypt.verify("wrong", h_u), 0)
+
+    // "$2a$05$CCCCCCCCCCCCCCCCCCCCC.VGOzA784oUp/Z0DY336zx7pLYAy0lwK", "U*U*"
+    h_u2 = bcrypt.hash_pw("U*U*", bytes.view(salt_u)[0..16], 5, "2a")
+    fails = fails + ck("bcrypt 2a U*U*", h_u2, "$2a$05$CCCCCCCCCCCCCCCCCCCCC.VGOzA784oUp/Z0DY336zx7pLYAy0lwK")
+    fails = fails + ck_int("bcrypt verify U*U*", bcrypt.verify("U*U*", h_u2), 1)
+
+    // "$2a$05$bvIG6Nmid91Mu9RcmmWZfO5HJIMCT8riNW0hEp8f6/FuA2/mHZFpe", "password"
+    salt_pw = bcrypt.base64_decode_salt("bvIG6Nmid91Mu9RcmmWZfO")
+    h_pw = bcrypt.hash_pw("password", bytes.view(salt_pw)[0..16], 5, "2a")
+    fails = fails + ck("bcrypt 2a password", h_pw, "$2a$05$bvIG6Nmid91Mu9RcmmWZfO5HJIMCT8riNW0hEp8f6/FuA2/mHZFpe")
+    fails = fails + ck_int("bcrypt verify password", bcrypt.verify("password", h_pw), 1)
+    fails = fails + ck_int("bcrypt verify incorrect password", bcrypt.verify("Password", h_pw), 0)
+
+    // 72-byte password truncation test
+    // {"$2a$05$abcdefghijklmnopqrstuu5s2v8.iXieOjg/.AySBTTZIIVFJeBui",
+    //  "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789chars after 72 are ignored"}
+    salt_72 = bcrypt.base64_decode_salt("abcdefghijklmnopqrstuu")
+    long_pw = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789chars after 72 are ignored"
+    h_72 = bcrypt.hash_pw(long_pw, bytes.view(salt_72)[0..16], 5, "2a")
+    fails = fails + ck("bcrypt 72-byte truncation", h_72, "$2a$05$abcdefghijklmnopqrstuu5s2v8.iXieOjg/.AySBTTZIIVFJeBui")
+    fails = fails + ck_int("bcrypt verify long_pw", bcrypt.verify(long_pw, h_72), 1)
+    // The prefix up to 72 characters should verify successfully as well
+    pw_72_only = string.substring(long_pw, 0, 72)
+    fails = fails + ck_int("bcrypt verify 72-char prefix", bcrypt.verify(pw_72_only, h_72), 1)
+
+    // Version test: 2b and 2y
+    salt_zero = bytes.new(16)
+    bytes.set_length(salt_zero, 16)
+    h_2b = bcrypt.hash_pw("test", bytes.view(salt_zero)[0..16], 4, "2b")
+    fails = fails + ck_int("bcrypt verify 2b", bcrypt.verify("test", h_2b), 1)
+    fails = fails + ck_int("bcrypt verify 2b wrong", bcrypt.verify("other", h_2b), 0)
+
+    h_2y = bcrypt.hash_pw("test", bytes.view(salt_zero)[0..16], 4, "2y")
+    fails = fails + ck_int("bcrypt verify 2y", bcrypt.verify("test", h_2y), 1)
+    fails = fails + ck_int("bcrypt verify 2y wrong", bcrypt.verify("other", h_2y), 0)
+
+    // Invalid parameters check
+    fails = fails + ck("invalid cost low", bcrypt.hash_pw("test", bytes.view(salt_zero)[0..16], 3, "2b"), "")
+    fails = fails + ck("invalid cost high", bcrypt.hash_pw("test", bytes.view(salt_zero)[0..16], 32, "2b"), "")
+    fails = fails + ck("invalid version", bcrypt.hash_pw("test", bytes.view(salt_zero)[0..16], 4, "3a"), "")
+    bad_salt = bytes.new(15)
+    bytes.set_length(bad_salt, 15)
+    fails = fails + ck("invalid salt len", bcrypt.hash_pw("test", bytes.view(bad_salt)[0..15], 4, "2b"), "")
+
+    // Cleanup
+    bytes.free(s1)
+    bytes.free(e0)
+    bytes.free(s2)
+    bytes.free(pwa0)
+    bytes.free(s3)
+    bytes.free(pwabc0)
+    bytes.free(pwa)
+    bytes.free(salt_u)
+    bytes.free(salt_pw)
+    bytes.free(salt_72)
+    bytes.free(salt_zero)
+    bytes.free(bad_salt)
+
+    if fails == 0 {
+        println("ALL BCRYPT UNIT TESTS PASSED")
+        return
+    }
+    println("${fails} FAILURES")
+    exit(1)
+}

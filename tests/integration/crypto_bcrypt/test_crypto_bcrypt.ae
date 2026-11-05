@@ -1,0 +1,87 @@
+// Integration tests for std.cryptography.bcrypt
+import std.cryptography.bcrypt
+import std.bytes
+import std.string
+
+ck(lbl: string, got: string, want: string) -> int {
+    if got == want {
+        println("ok   ${lbl}")
+        return 0
+    }
+    println("FAIL ${lbl}")
+    println("  got:  ${got}")
+    println("  want: ${want}")
+    return 1
+}
+
+ck_int(lbl: string, got: int, want: int) -> int {
+    if got == want {
+        println("ok   ${lbl}")
+        return 0
+    }
+    println("FAIL ${lbl}")
+    println("  got:  ${got}")
+    println("  want: ${want}")
+    return 1
+}
+
+main() {
+    fails = 0
+
+    // Test vectors from BCrypt.Net / OpenBSDBCryptTest:
+    // {"", "$2a$06$DCq7YPn5Rq63x1Lad4cll.", "$2a$06$DCq7YPn5Rq63x1Lad4cll.TV4S6ytwfsfvkgY8jIucDrjc8deX1s."}
+    s1 = bcrypt.base64_decode_salt("DCq7YPn5Rq63x1Lad4cll.")
+    fails = fails + ck("empty pw cost 6",
+        bcrypt.hash_pw("", bytes.view(s1)[0..16], 6, "2a"),
+        "$2a$06$DCq7YPn5Rq63x1Lad4cll.TV4S6ytwfsfvkgY8jIucDrjc8deX1s.")
+    fails = fails + ck_int("check_pw empty pw",
+        bcrypt.check_pw("", "$2a$06$DCq7YPn5Rq63x1Lad4cll.TV4S6ytwfsfvkgY8jIucDrjc8deX1s."),
+        1)
+
+    // {"a", "$2a$06$m0CrhHm10qJ3lXRY.5zDGO", "$2a$06$m0CrhHm10qJ3lXRY.5zDGO3rS2KdeeWLuGmsfGlMfOxih58VYVfxe"}
+    s2 = bcrypt.base64_decode_salt("m0CrhHm10qJ3lXRY.5zDGO")
+    fails = fails + ck("a cost 6",
+        bcrypt.hash_pw("a", bytes.view(s2)[0..16], 6, "2a"),
+        "$2a$06$m0CrhHm10qJ3lXRY.5zDGO3rS2KdeeWLuGmsfGlMfOxih58VYVfxe")
+    fails = fails + ck_int("check_pw a",
+        bcrypt.check_pw("a", "$2a$06$m0CrhHm10qJ3lXRY.5zDGO3rS2KdeeWLuGmsfGlMfOxih58VYVfxe"),
+        1)
+
+    // {"abc", "$2a$06$If6bvum7DFjUnE9p2uDeDu", "$2a$06$If6bvum7DFjUnE9p2uDeDu0YHzrHM6tf.iqN8.yx.jNN1ILEf7h0i"}
+    s3 = bcrypt.base64_decode_salt("If6bvum7DFjUnE9p2uDeDu")
+    fails = fails + ck("abc cost 6",
+        bcrypt.hash_pw("abc", bytes.view(s3)[0..16], 6, "2a"),
+        "$2a$06$If6bvum7DFjUnE9p2uDeDu0YHzrHM6tf.iqN8.yx.jNN1ILEf7h0i")
+    fails = fails + ck_int("check_pw abc",
+        bcrypt.check_pw("abc", "$2a$06$If6bvum7DFjUnE9p2uDeDu0YHzrHM6tf.iqN8.yx.jNN1ILEf7h0i"),
+        1)
+
+    // CryptSharp vectors:
+    // {">l_7}xxH3|Cr{dCR[HTUN@k~", "$2a$05$24xz81ZZsMUMm940bbWMCeHsO.s6A3MG0JZzm4y3.Ti6P96bz6RN6"}
+    h_cs = "$2a$05$24xz81ZZsMUMm940bbWMCeHsO.s6A3MG0JZzm4y3.Ti6P96bz6RN6"
+    pw_cs = ">l_7}xxH3|Cr{dCR[HTUN@k~"
+    fails = fails + ck_int("cryptsharp check_pw match", bcrypt.check_pw(pw_cs, h_cs), 1)
+    fails = fails + ck_int("cryptsharp check_pw mismatch", bcrypt.check_pw("wrong_password", h_cs), 0)
+
+    // 2b and 2y verification against standard test cases
+    // {"a", "$2y$12$DB3BUbYa/SsEL7kCOVji0OauTkPkB5Y1OeyfxJHM7jvMrbml5sgD2"} - cost 12
+    // Let us verify check_pw parses and validates existing $2y$ and $2b$ hashes:
+    // (Note: cost 12 takes ~4096 rounds, easily computed in <1s)
+    h_2y = "$2y$12$DB3BUbYa/SsEL7kCOVji0OauTkPkB5Y1OeyfxJHM7jvMrbml5sgD2"
+    fails = fails + ck_int("check_pw 2y cost 12", bcrypt.check_pw("a", h_2y), 1)
+    fails = fails + ck_int("check_pw 2y cost 12 bad", bcrypt.check_pw("b", h_2y), 0)
+
+    h_2b = "$2b$12$DB3BUbYa/SsEL7kCOVji0OauTkPkB5Y1OeyfxJHM7jvMrbml5sgD2"
+    fails = fails + ck_int("check_pw 2b cost 12", bcrypt.check_pw("a", h_2b), 1)
+
+    bytes.free(s1)
+    bytes.free(s2)
+    bytes.free(s3)
+
+    if fails == 0 {
+        println("ALL BCRYPT INTEGRATION TESTS PASSED")
+        return
+    }
+    println("${fails} FAILURES")
+    exit(1)
+}
